@@ -92,20 +92,23 @@ class RobotController(Node):
         min_range = 0.12  # 12cm minimum range for LDS-02
         max_range = 3.5   # 3.5m maximum range for LDS-02
         
-        # Clean up the ranges array
-        # Replace invalid values (0's, inf's, and nan's) with max_range
+        # Clean up the ranges array and invert the distances
         # Convert to float32 to match ROS2 data type
         ranges = ranges.astype(np.float32)
         
         # Create a mask for valid measurements
         valid_mask = (ranges >= min_range) & (ranges <= max_range) & (~np.isnan(ranges)) & (~np.isinf(ranges))
-        ranges[~valid_mask] = max_range
+        
+        # Invert valid measurements (max_range - distance) so closer objects show smaller numbers
+        ranges[valid_mask] = max_range - ranges[valid_mask]
+        # Invalid measurements become 0 (indicating no obstacle)
+        ranges[~valid_mask] = 0.0
         
         # Define the angular resolution for six sectors (360° divided into 6 sectors = 60° each)
         num_sectors = 6
         sector_size = len(ranges) // num_sectors
         
-        # Extract minimum distances from each sector
+        # Extract maximum distances from each sector (now that values are inverted, we want maximum)
         distances = []
         for i in range(num_sectors):
             start_idx = ((i + 3) % num_sectors) * sector_size  # Shift by 3 sectors (180°) to align front
@@ -115,14 +118,9 @@ class RobotController(Node):
             else:
                 sector = ranges[start_idx:end_idx]
             
-            # Only consider valid measurements when finding the minimum
-            valid_measurements = sector[sector < max_range]
-            if len(valid_measurements) > 0:
-                min_distance = np.min(valid_measurements)
-            else:
-                min_distance = max_range
-            
-            distances.append(min_distance)
+            # Find maximum of inverted distances (closest object)
+            max_distance = np.max(sector)
+            distances.append(max_distance)
 
         # Store the processed distances in a dictionary for reference
         self.lidar_data = {
