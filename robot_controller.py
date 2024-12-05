@@ -88,22 +88,24 @@ class RobotController(Node):
         """
         ranges = np.array(msg.ranges)  # Convert ranges to a numpy array for easier processing
         
-        # LDS-02 specific parameters
-        min_range = msg.range_min
-        max_range = msg.range_max
+        # LDS-02 specific parameters - explicitly set these values
+        min_range = 0.12  # 12cm minimum range for LDS-02
+        max_range = 3.5   # 3.5m maximum range for LDS-02
         
         # Clean up the ranges array
-        # Replace 0's, inf's, and nan's with max_range
-        # Also filter out values below min_range
-        ranges = np.where((ranges < min_range) | (ranges > max_range) | (np.isnan(ranges)), max_range, ranges)
+        # Replace invalid values (0's, inf's, and nan's) with max_range
+        # Convert to float32 to match ROS2 data type
+        ranges = ranges.astype(np.float32)
+        
+        # Create a mask for valid measurements
+        valid_mask = (ranges >= min_range) & (ranges <= max_range) & (~np.isnan(ranges)) & (~np.isinf(ranges))
+        ranges[~valid_mask] = max_range
         
         # Define the angular resolution for six sectors (360° divided into 6 sectors = 60° each)
         num_sectors = 6
         sector_size = len(ranges) // num_sectors
         
         # Extract minimum distances from each sector
-        # Note: LDS-02 scans counterclockwise, starting from the back
-        # We need to shift the sectors to align with the robot's front
         distances = []
         for i in range(num_sectors):
             start_idx = ((i + 3) % num_sectors) * sector_size  # Shift by 3 sectors (180°) to align front
@@ -112,7 +114,14 @@ class RobotController(Node):
                 sector = np.concatenate([ranges[start_idx:], ranges[:end_idx - len(ranges)]])
             else:
                 sector = ranges[start_idx:end_idx]
-            min_distance = np.min(sector)  # Find the minimum distance in the sector
+            
+            # Only consider valid measurements when finding the minimum
+            valid_measurements = sector[sector < max_range]
+            if len(valid_measurements) > 0:
+                min_distance = np.min(valid_measurements)
+            else:
+                min_distance = max_range
+            
             distances.append(min_distance)
 
         # Store the processed distances in a dictionary for reference
