@@ -128,12 +128,12 @@ class RobotController(Node):
 
             distances.append(mapped_distance)
 
-        # Assign sectors based on corrected mapping
+        # Assign sectors with corrected front/rear/side mapping
         self.lidar_data = {
-            "front": distances[2],        # Front sector
-            "front_right": distances[3],  # Front Right sector
-            "right": distances[4],        # Right sector
-            "rear": distances[5],         # Rear sector
+            "front": distances[5],        # Front sector
+            "front_right": distances[4],  # Front Right sector (was 3)
+            "right": distances[3],        # Right sector (was 4)
+            "rear": distances[2],         # Rear sector
             "left": distances[1],         # Left sector
             "front_left": distances[0]    # Front Left sector
         }
