@@ -87,30 +87,42 @@ class RobotController(Node):
         The points represent the minimum distance in six evenly divided angular sectors.
         """
         ranges = np.array(msg.ranges)  # Convert ranges to a numpy array for easier processing
-        max_range = msg.range_max      # Use the sensor's max range to replace invalid data
         
-        # Replace NaN or invalid values with max_range
-        ranges = np.nan_to_num(ranges, nan=max_range, posinf=max_range, neginf=max_range)
-
+        # LDS-02 specific parameters
+        min_range = msg.range_min
+        max_range = msg.range_max
+        
+        # Clean up the ranges array
+        # Replace 0's, inf's, and nan's with max_range
+        # Also filter out values below min_range
+        ranges = np.where((ranges < min_range) | (ranges > max_range) | (np.isnan(ranges)), max_range, ranges)
+        
         # Define the angular resolution for six sectors (360° divided into 6 sectors = 60° each)
         num_sectors = 6
         sector_size = len(ranges) // num_sectors
-
+        
         # Extract minimum distances from each sector
+        # Note: LDS-02 scans counterclockwise, starting from the back
+        # We need to shift the sectors to align with the robot's front
         distances = []
         for i in range(num_sectors):
-            sector = ranges[i * sector_size: (i + 1) * sector_size]
+            start_idx = ((i + 3) % num_sectors) * sector_size  # Shift by 3 sectors (180°) to align front
+            end_idx = start_idx + sector_size
+            if end_idx > len(ranges):  # Handle wrap-around
+                sector = np.concatenate([ranges[start_idx:], ranges[:end_idx - len(ranges)]])
+            else:
+                sector = ranges[start_idx:end_idx]
             min_distance = np.min(sector)  # Find the minimum distance in the sector
             distances.append(min_distance)
 
         # Store the processed distances in a dictionary for reference
         self.lidar_data = {
-            "front": distances[0],       # 0° to 60°
-            "front_left": distances[1],  # 60° to 120°
-            "left": distances[2],        # 120° to 180°
-            "rear": distances[3],        # 180° to 240°
-            "right": distances[4],       # 240° to 300°
-            "front_right": distances[5]  # 300° to 360°
+            "front": distances[0],       # 330° to 30° (front center)
+            "front_right": distances[1], # 30° to 90°
+            "right": distances[2],       # 90° to 150°
+            "rear": distances[3],        # 150° to 210°
+            "left": distances[4],        # 210° to 270°
+            "front_left": distances[5]   # 270° to 330°
         }
 
         # Log the distances for debugging
