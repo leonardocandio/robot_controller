@@ -131,20 +131,12 @@ class RobotController(Node):
         # Assign sectors with corrected front/rear/side mapping
         self.lidar_data = {
             "front": distances[5],        # Front sector
-            "front_right": distances[4],  # Front Right sector (was 3)
-            "right": distances[3],        # Right sector (was 4)
+            "front_right": distances[4],  # Front Right sector
+            "right": distances[3],        # Right sector
             "rear": distances[2],         # Rear sector
             "left": distances[1],         # Left sector
             "front_left": distances[0]    # Front Left sector
         }
-
-        # Log the distances for debugging
-        logger.info(
-            f"LiDAR Distances - Front: {self.lidar_data['front']:.2f} m, "
-            f"Front Left: {self.lidar_data['front_left']:.2f} m, Left: {self.lidar_data['left']:.2f} m, "
-            f"Rear: {self.lidar_data['rear']:.2f} m, Right: {self.lidar_data['right']:.2f} m, "
-            f"Front Right: {self.lidar_data['front_right']:.2f} m"
-        )
 
 
     def camera_callback(self, msg):
@@ -187,12 +179,23 @@ class RobotController(Node):
             self.get_logger().error(f'Failed to encode image: {str(e)}')
             return Twist()
 
+        # Log the LiDAR distances when analyzing image
+        logger.info(
+            f"LiDAR Distances - Front: {self.lidar_data['front']:.2f} m, "
+            f"Front Left: {self.lidar_data['front_left']:.2f} m, Left: {self.lidar_data['left']:.2f} m, "
+            f"Rear: {self.lidar_data['rear']:.2f} m, Right: {self.lidar_data['right']:.2f} m, "
+            f"Front Right: {self.lidar_data['front_right']:.2f} m"
+        )
+
         # Combine LiDAR and image data in the model prompt
         lidar_context = (
-            f"Front obstacle distance: {self.lidar_data['min_front']:.2f} meters. "
-            f"Left obstacle distance: {self.lidar_data['min_left']:.2f} meters. "
-            f"Right obstacle distance: {self.lidar_data['min_right']:.2f} meters. "
-            if self.lidar_data else "LiDAR data not available."
+            f"LiDAR readings: "
+            f"Front: {self.lidar_data['front']:.2f}m, "
+            f"Front-Left: {self.lidar_data['front_left']:.2f}m, "
+            f"Front-Right: {self.lidar_data['front_right']:.2f}m, "
+            f"Left: {self.lidar_data['left']:.2f}m, "
+            f"Right: {self.lidar_data['right']:.2f}m, "
+            f"Rear: {self.lidar_data['rear']:.2f}m. "
         )
         prompt = (
             f"This is image {self.image_count}. {lidar_context} Analyze it to generate control commands."
