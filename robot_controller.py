@@ -163,6 +163,11 @@ class RobotController(Node):
                 scan_length = len(self.laserscan)
                 step_size = 360.0 / scan_length
 
+                # Robust distance calculations
+                def safe_mean(arr):
+                    valid_ranges = arr[np.isfinite(arr)]
+                    return np.mean(valid_ranges) if len(valid_ranges) > 0 else 3.5
+
                 # Wider detection sectors
                 front_sector = max(1, int(45 / step_size))  # Increased front sector
                 side_sector = max(1, int(60 / step_size))  # Increased side sector
