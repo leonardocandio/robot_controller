@@ -78,6 +78,7 @@ class RobotController(Node):
         self.start_mode = "outside"
         self.start_time = self.get_clock().now()
         self.ctrl_msg = Twist()
+        self.prefer_left_turns = True
 
     def robot_lidar_callback(self, msg):
         # Robust LIDAR data preprocessing
@@ -145,16 +146,16 @@ class RobotController(Node):
                     or front_right < FRONT_OBSTACLE_THRESHOLD
                 ):
                     # Obstacle directly in front or on sides
-                    if front_left > front_right:
-                        # More space on left, turn right
-                        LIN_VEL = 0.05  # Very slow forward movement
-                        ANG_VEL = -1.2  # Strong right turn
-                        print("OBSTACLE AHEAD: Turning Right")
-                    else:
-                        # More space on right, turn left
+                    if (front_left > front_right) == self.prefer_left_turns:
+                        # Turn left if more space on left (and preferring left) or more space on right (and preferring right)
                         LIN_VEL = 0.05  # Very slow forward movement
                         ANG_VEL = 1.2  # Strong left turn
                         print("OBSTACLE AHEAD: Turning Left")
+                    else:
+                        # Turn right if more space on right (and preferring left) or more space on left (and preferring right)
+                        LIN_VEL = 0.05  # Very slow forward movement
+                        ANG_VEL = -1.2  # Strong right turn
+                        print("OBSTACLE AHEAD: Turning Right")
 
                 elif (
                     left_side < SIDE_OBSTACLE_THRESHOLD
