@@ -30,17 +30,13 @@ class PIDController:
         if dt > 0.0:
             self.err_hist.put(err)  # Update error history
             self.err_int += err  # Integrate error
-            if self.err_hist.full():  # Jacketing logic to prevent integral windup
+            if self.err_hist.full():  # Prevent integral windup
                 self.err_int -= self.err_hist.get()  # Rolling FIFO buffer
-            self.err_dif = err - self.err_prev  # Error difference
-            u = (
-                (self.kP * err)
-                + (self.kI * self.err_int * dt)
-                + (self.kD * self.err_dif / dt)
-            )  # PID control law
-            self.err_prev = err  # Update previous error term
-            self.t_prev = t  # Update timestamp
-            return u  # Control signal
+            self.err_dif = err - self.err_prev
+            u = (self.kP * err) + (self.kI * self.err_int * dt) + (self.kD * self.err_dif / dt)
+            self.err_prev = err
+            self.t_prev = t
+            return u
         return 0
 
 
@@ -68,7 +64,7 @@ class RobotController(Node):
         timer_period = 0.001  # Node execution time period (seconds)
         self.timer = self.create_timer(timer_period, self.robot_controller_callback)
 
-        # PID Controllers
+        # PID Controllers (do not change configuration)
         self.pid_1_lat = PIDController(0.3, 0.01, 0.1, 10)
         self.pid_1_lon = PIDController(0.1, 0.001, 0.005, 10)
 
@@ -83,11 +79,7 @@ class RobotController(Node):
     def robot_lidar_callback(self, msg):
         # Robust LIDAR data preprocessing
         ranges = np.array(msg.ranges)
-
-        # Replace NaN and inf with maximum sensor range
         ranges = np.nan_to_num(ranges, nan=3.5, posinf=3.5, neginf=3.5)
-
-        # Filter out extreme or invalid ranges
         ranges = np.clip(ranges, 0.1, 3.5)
 
         self.laserscan = ranges
@@ -102,91 +94,76 @@ class RobotController(Node):
                 step_size = 360.0 / scan_length
 
                 # Safe sector calculation
-                front_sector = max(1, int(30 / step_size))  # Wider front sector
-                side_sector = max(1, int(45 / step_size))  # Wider side sector
+                front_sector = max(1, int(30 / step_size))
+                side_sector = max(1, int(45 / step_size))
 
-                # Robust distance calculations
                 def safe_mean(arr):
                     valid_ranges = arr[np.isfinite(arr)]
                     return np.mean(valid_ranges) if len(valid_ranges) > 0 else 3.5
 
-                # More granular obstacle detection
+                # Compute distances in various directions
                 front_left = safe_mean(self.laserscan[: int(scan_length / 4)])
-                front_right = safe_mean(self.laserscan[-int(scan_length / 4) :])
+                front_right = safe_mean(self.laserscan[-int(scan_length / 4):])
                 front_center = safe_mean(
-                    np.concatenate(
-                        [self.laserscan[:front_sector], self.laserscan[-front_sector:]]
-                    )
+                    np.concatenate([self.laserscan[:front_sector], self.laserscan[-front_sector:]])
                 )
-
-                # Additional side and diagonal sectors
-                left_side = safe_mean(
-                    self.laserscan[int(scan_length / 4) : int(scan_length / 2)]
-                )
-                right_side = safe_mean(
-                    self.laserscan[int(scan_length / 2) : int(3 * scan_length / 4)]
-                )
+                left_side = safe_mean(self.laserscan[int(scan_length / 4): int(scan_length / 2)])
+                right_side = safe_mean(self.laserscan[int(scan_length / 2): int(3 * scan_length / 4)])
 
                 # Timestamp for PID
                 tstamp = time.time()
 
-                # More aggressive obstacle detection thresholds
-                FRONT_OBSTACLE_THRESHOLD = 0.7  # Larger threshold for front
-                SIDE_OBSTACLE_THRESHOLD = 0.5  # Smaller threshold for sides
+                # Thresholds (unchanged)
+                FRONT_OBSTACLE_THRESHOLD = 0.7
+                SIDE_OBSTACLE_THRESHOLD = 0.5
 
-                # Debugging print statements
+                # Debugging print
                 print(
                     f"Distances - Front: {front_center:.2f}, Left: {front_left:.2f}, Right: {front_right:.2f}, Side-Left: {left_side:.2f}, Side-Right: {right_side:.2f}"
                 )
 
-                # Advanced Obstacle Avoidance Logic
-                if (
-                    front_center < FRONT_OBSTACLE_THRESHOLD
-                    or front_left < FRONT_OBSTACLE_THRESHOLD
-                    or front_right < FRONT_OBSTACLE_THRESHOLD
-                ):
-                    # Obstacle directly in front or on sides
+                # Decision logic
+                if (front_center < FRONT_OBSTACLE_THRESHOLD or
+                    front_left < FRONT_OBSTACLE_THRESHOLD or
+                    front_right < FRONT_OBSTACLE_THRESHOLD):
+                    # Obstacle ahead, slow down and turn
                     if (front_left > front_right) == self.prefer_left_turns:
-                        # Turn left if more space on left (and preferring left) or more space on right (and preferring right)
-                        LIN_VEL = 0.05  # Very slow forward movement
-                        ANG_VEL = 1.2  # Strong left turn
+                        LIN_VEL = 0.05
+                        ANG_VEL = 1.2
                         print("OBSTACLE AHEAD: Turning Left")
                     else:
-                        # Turn right if more space on right (and preferring left) or more space on left (and preferring right)
-                        LIN_VEL = 0.05  # Very slow forward movement
-                        ANG_VEL = -1.2  # Strong right turn
+                        LIN_VEL = 0.05
+                        ANG_VEL = -1.2
                         print("OBSTACLE AHEAD: Turning Right")
 
-                elif (
-                    left_side < SIDE_OBSTACLE_THRESHOLD
-                    or right_side < SIDE_OBSTACLE_THRESHOLD
-                ):
-                    # Obstacles on sides
+                elif (left_side < SIDE_OBSTACLE_THRESHOLD or right_side < SIDE_OBSTACLE_THRESHOLD):
+                    # Obstacle on sides, slow slightly and turn away
                     if left_side < SIDE_OBSTACLE_THRESHOLD:
-                        # Obstacle on left, turn right
                         LIN_VEL = 0.1
                         ANG_VEL = -0.8
                         print("SIDE OBSTACLE: Turning Right")
                     else:
-                        # Obstacle on right, turn left
                         LIN_VEL = 0.1
                         ANG_VEL = 0.8
                         print("SIDE OBSTACLE: Turning Left")
 
                 else:
-                    # Normal wall following with more aggressive correction
-                    LIN_VEL = 0.2
-                    ANG_VEL = self.pid_1_lat.control(
-                        (left_side - right_side) * 2.0,  # Increased sensitivity
-                        tstamp,
-                    )
-                    print("Wall Following")
+                    # Path is clear, go at maximum allowed speed and follow walls
+                    # Increased linear velocity from 0.2 to 0.22 to maximize forward speed
+                    LIN_VEL = 0.22
+                    ANG_VEL = self.pid_1_lat.control((left_side - right_side) * 2.0, tstamp)
+                    print("Wall Following - MAX SPEED")
 
-                # Velocity Limits
+                # Enforce velocity limits
                 self.ctrl_msg.linear.x = min(0.22, float(LIN_VEL))
-                self.ctrl_msg.angular.z = min(2.84, float(ANG_VEL))
+                # Keep angular velocity within safe limits
+                if ANG_VEL > 2.84:
+                    ANG_VEL = 2.84
+                elif ANG_VEL < -2.84:
+                    ANG_VEL = -2.84
+                self.ctrl_msg.angular.z = ANG_VEL
 
-                # Publish control message
+                # Publish the command
                 self.robot_ctrl_pub.publish(self.ctrl_msg)
         else:
             print("Initializing...")
