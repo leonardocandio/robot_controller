@@ -48,9 +48,6 @@ class PIDController:
 
 class RobotController(Node):
     def __init__(self):
-        # Information and debugging
-        info = "\nMake the robot follow wall, avoid obstacles, follow line, detect stop sign and track AprilTag marker.\n"
-        print(info)
 
         # ROS2 infrastructure
         super().__init__("robot_controller")
@@ -232,16 +229,16 @@ class RobotController(Node):
                         if (front_left > front_right) == self.prefer_left_turns:
                             LIN_VEL = 0.12
                             ANG_VEL = MAX_ANGULAR_VEL
-                            self.get_logger().info("🔄 Smooth left turn - FL: %.2f, FR: %.2f", front_left, front_right)
+                            self.get_logger().info("Smooth left turn - FL: %.2f, FR: %.2f" % (front_left, front_right))
                         else:
                             LIN_VEL = 0.12
                             ANG_VEL = -MAX_ANGULAR_VEL
-                            self.get_logger().info("🔄 Smooth right turn - FL: %.2f, FR: %.2f", front_left, front_right)
+                            self.get_logger().info("Smooth right turn - FL: %.2f, FR: %.2f" % (front_left, front_right))
 
                     else:
                         # Wall following with safety margins
                         LIN_VEL = BASE_SPEED
-                        wall_diff = (left_wall_estimate - right_wall_estimate) * 1.2  # Further reduced multiplier
+                        wall_diff = (left_wall_estimate - right_wall_estimate) * 1.2
                         ANG_VEL = self.pid_1_lat.control(wall_diff, time.time())
                         
                         # Limit angular velocity
@@ -249,23 +246,23 @@ class RobotController(Node):
                         
                         # Comprehensive logging
                         self.get_logger().info(
-                            "🏃 Racing Status:\n"
+                            "Racing Status:\n"
                             "  Speed: %.2f m/s\n"
-                            "  Turn Rate: %.2f rad/s\n"
+                            "  Turn Rate: %.2f m/s\n"
                             "  Distances - Left: %.2f, Right: %.2f, Front: %.2f\n"
-                            "  Wall Difference: %.2f",
-                            LIN_VEL, ANG_VEL, left_wall_estimate, 
-                            right_wall_estimate, front_center, wall_diff
+                            "  Wall Difference: %.2f" % 
+                            (LIN_VEL, ANG_VEL, left_wall_estimate, 
+                             right_wall_estimate, front_center, wall_diff)
                         )
 
                 # More conservative velocity limits for larger robot
-                self.ctrl_msg.linear.x = min(0.25, float(LIN_VEL))  # Reduced max speed
+                self.ctrl_msg.linear.x = min(0.25, float(LIN_VEL))
                 self.ctrl_msg.angular.z = min(MAX_ANGULAR_VEL, float(ANG_VEL))
 
                 self.robot_ctrl_pub.publish(self.ctrl_msg)
         else:
-            self.get_logger().info("⏳ Initializing... %.1f seconds remaining", 
-                                 DELAY - (self.get_clock().now() - self.start_time).nanoseconds/1e9)
+            self.get_logger().info("Initializing... %.1f seconds remaining" % 
+                                 (DELAY - (self.get_clock().now() - self.start_time).nanoseconds/1e9))
 
 
 def main(args=None):
