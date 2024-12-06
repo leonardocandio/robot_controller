@@ -165,31 +165,59 @@ class RobotController(Node):
 
         # State machine for navigation
         if self.current_state == NavigationState.BACKTRACKING:
-            # Perform recovery behavior
-            self.ctrl_msg.linear.x = -0.1
-            self.ctrl_msg.angular.z = 0.5
-            if not self.check_if_stuck():
+            # Instead of moving backwards, perform a rotation to find clear path
+            self.ctrl_msg.linear.x = 0.0
+            self.ctrl_msg.angular.z = 1.0  # Rotate in place
+            
+            # If there's clear space in front, return to exploring
+            if sectors['front'] > 0.8 and sectors['front_left'] > 0.6 and sectors['front_right'] > 0.6:
                 self.current_state = NavigationState.EXPLORING
                 self.pid_wall.reset()
                 self.pid_obstacle.reset()
 
         elif sectors['front'] < 0.5 or sectors['front_left'] < 0.4 or sectors['front_right'] < 0.4:
-            # Obstacle avoidance state
+            # Enhanced obstacle avoidance without backward movement
             self.current_state = NavigationState.OBSTACLE_AVOIDANCE
-            turn_direction = 1.0 if sectors['front_left'] > sectors['front_right'] else -1.0
-            self.ctrl_msg.linear.x = 0.05
-            self.ctrl_msg.angular.z = turn_direction * 0.8
+            
+            # Determine the best rotation direction
+            left_space = sectors['front_left'] + sectors['left']
+            right_space = sectors['front_right'] + sectors['right']
+            turn_direction = 1.0 if left_space > right_space else -1.0
+            
+            # If very close to obstacle, stop and rotate
+            if sectors['front'] < 0.3:
+                self.ctrl_msg.linear.x = 0.0
+                self.ctrl_msg.angular.z = turn_direction * 1.2  # Faster rotation when too close
+            else:
+                # Slow forward movement while turning
+                self.ctrl_msg.linear.x = 0.05
+                self.ctrl_msg.angular.z = turn_direction * 0.8
 
         elif self.current_state == NavigationState.EXPLORING:
-            # Normal exploration with wall following
+            # Modified wall following behavior
             target_wall_distance = 0.6
-            wall_error = target_wall_distance - min(sectors['left'], sectors['right'])
             
-            self.ctrl_msg.linear.x = 0.2
-            self.ctrl_msg.angular.z = self.pid_wall.control(wall_error, time.time())
+            # Determine which wall to follow
+            left_wall_dist = sectors['left']
+            right_wall_dist = sectors['right']
+            
+            if left_wall_dist < right_wall_dist and left_wall_dist < 1.0:
+                # Follow left wall
+                wall_error = target_wall_distance - left_wall_dist
+                self.ctrl_msg.linear.x = 0.15
+                self.ctrl_msg.angular.z = self.pid_wall.control(wall_error, time.time())
+            elif right_wall_dist < 1.0:
+                # Follow right wall
+                wall_error = target_wall_distance - right_wall_dist
+                self.ctrl_msg.linear.x = 0.15
+                self.ctrl_msg.angular.z = -self.pid_wall.control(wall_error, time.time())
+            else:
+                # No nearby walls, explore with slight rotation to find walls
+                self.ctrl_msg.linear.x = 0.2
+                self.ctrl_msg.angular.z = 0.2  # Slight rotation to encourage exploration
 
         # Apply velocity limits
-        self.ctrl_msg.linear.x = np.clip(self.ctrl_msg.linear.x, -0.22, 0.22)
+        self.ctrl_msg.linear.x = np.clip(self.ctrl_msg.linear.x, 0.0, 0.22)  # Minimum velocity is now 0
         self.ctrl_msg.angular.z = np.clip(self.ctrl_msg.angular.z, -2.84, 2.84)
         
         # Update position estimate and publish control
