@@ -215,12 +215,10 @@ class RobotController(Node):
 
                 # Find minimum distances in critical sectors
                 front_min = min(
-                    np.min(self.laserscan[:front_sector]),
-                    np.min(self.laserscan[-front_sector:])
+                    float(np.min(self.laserscan[:front_sector])),
+                    float(np.min(self.laserscan[-front_sector:]))
                 )
-                sides_min = min(
-                    np.min(self.laserscan[int(scan_length/4):int(3*scan_length/4)])
-                )
+                sides_min = float(np.min(self.laserscan[int(scan_length/4):int(3*scan_length/4)]))
 
                 # Timestamp for PID
                 tstamp = time.time()
