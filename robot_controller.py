@@ -1,263 +1,203 @@
-#!/usr/bin/env python3
-
+# ROS2 module imports
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import Image, LaserScan
 from geometry_msgs.msg import Twist
-from cv_bridge import CvBridge
-import cv2
-import numpy as np
-import logging
-import ollama
-import time
-from rclpy.qos import QoSProfile, ReliabilityPolicy
+from sensor_msgs.msg import LaserScan
+from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
+from rclpy.qos import qos_profile_sensor_data
+from rclpy.duration import Duration
 
-# Initialize logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger("RobotController")
+# Python module imports
+import numpy as np
+import queue
+import time
+
+
+class PIDController:
+    def __init__(self, kP, kI, kD, kS):
+        self.kP = kP  # Proportional gain
+        self.kI = kI  # Integral gain
+        self.kD = kD  # Derivative gain
+        self.kS = kS  # Saturation constant (error history buffer size)
+        self.err_int = 0  # Error integral
+        self.err_dif = 0  # Error difference
+        self.err_prev = 0  # Previous error
+        self.err_hist = queue.Queue(self.kS)  # Limited buffer of error history
+        self.t_prev = 0  # Previous time
+
+    def control(self, err, t):
+        dt = t - self.t_prev  # Timestep
+        if dt > 0.0:
+            self.err_hist.put(err)  # Update error history
+            self.err_int += err  # Integrate error
+            if self.err_hist.full():  # Jacketing logic to prevent integral windup
+                self.err_int -= self.err_hist.get()  # Rolling FIFO buffer
+            self.err_dif = err - self.err_prev  # Error difference
+            u = (
+                (self.kP * err)
+                + (self.kI * self.err_int * dt)
+                + (self.kD * self.err_dif / dt)
+            )  # PID control law
+            self.err_prev = err  # Update previous error term
+            self.t_prev = t  # Update timestamp
+            return u  # Control signal
+        return 0
+
 
 class RobotController(Node):
-    def __init__(self, model_name, model_prompt):
-        super().__init__('robot_controller')
-        
-        # Initialize variables
-        self.bridge = CvBridge()
-        self.ollama_client = ollama.Client()
-        self.model_name = model_name
-        self.model_prompt = model_prompt
-        self.last_image = None
-        self.is_turning = False
-        self.turn_direction = None
-        self.obstacle_detected = False
-        
-        # Constants
-        self.FRONT_OBSTACLE_THRESHOLD = 0.5  # meters
-        self.TURNING_SPEED = 0.5  # rad/s
-        self.FORWARD_SPEED = 0.2  # m/s
-        self.MIN_FRONT_ANGLE = -30  # degrees
-        self.MAX_FRONT_ANGLE = 30   # degrees
-        
-        # Create the model
-        self.create_model()
-        
-        # Subscriptions
-        self.camera_subscription = self.create_subscription(
-            Image,
-            '/image_raw',
-            self.camera_callback,
-            10)
+    def __init__(self):
+        # Information and debugging
+        info = "\nMake the robot follow wall, avoid obstacles, follow line, detect stop sign and track AprilTag marker.\n"
+        print(info)
 
-        self.lidar_subscription = self.create_subscription(
-            LaserScan,
-            '/scan',
-            self.lidar_callback,
-            qos_profile=QoSProfile(
-                reliability=ReliabilityPolicy.BEST_EFFORT,
-                depth=10
-            )
+        # ROS2 infrastructure
+        super().__init__("robot_controller")
+
+        qos_profile = QoSProfile(
+            reliability=QoSReliabilityPolicy.RMW_QOS_POLICY_RELIABILITY_RELIABLE,
+            history=QoSHistoryPolicy.RMW_QOS_POLICY_HISTORY_KEEP_LAST,
+            depth=10,
         )
 
-        # Publisher
-        self.control_publisher = self.create_publisher(
-            Twist,
-            'cmd_vel',
-            10)
+        self.robot_lidar_sub = self.create_subscription(
+            LaserScan, "/scan", self.robot_lidar_callback, qos_profile_sensor_data
+        )
 
-        # Add timing variables for periodic logging
-        self.last_log_time = time.time()
-        self.LOG_INTERVAL = 1.0  # Log every 1 second
-        
-        # Add variables to store latest readings
-        self.latest_lidar_readings = None
-        self.latest_model_response = None
-        self.latest_front_distance = None
+        self.robot_ctrl_pub = self.create_publisher(Twist, "/cmd_vel", qos_profile)
 
-        logger.info('Robot Controller Node initialized')
+        timer_period = 0.001  # Node execution time period (seconds)
+        self.timer = self.create_timer(timer_period, self.robot_controller_callback)
 
-    def create_model(self):
-        try:
-            modelfile = f"""from {self.model_name}
-            parameter temperature 0.5
-            system "You are analyzing obstacles in a robot race track. Identify if the obstacle is another robot or a track wall/obstacle. If it's a wall, suggest which direction to turn (left or right) based on the track layout. Format response as: <type>robot/wall</type><direction>left/right</direction>"
-            """
-            self.ollama_client.create(model=self.model_name, modelfile=modelfile)
-            logger.info(f"Model '{self.model_name}' created successfully")
-        except Exception as e:
-            logger.error(f"Failed to create model: {str(e)}")
+        # PID Controllers
+        self.pid_1_lat = PIDController(0.3, 0.01, 0.1, 10)
+        self.pid_1_lon = PIDController(0.1, 0.001, 0.005, 10)
 
-    def camera_callback(self, msg):
-        """Store the latest image for obstacle analysis"""
-        try:
-            self.last_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
-        except Exception as e:
-            logger.error(f'Failed to convert image: {str(e)}')
+        # State variables
+        self.lidar_available = False
+        self.laserscan = None
+        self.start_mode = "outside"
+        self.start_time = self.get_clock().now()
+        self.ctrl_msg = Twist()
 
-    def get_front_distance(self, ranges):
-        """Get the minimum distance in the front sector"""
-        angles = np.arange(len(ranges))
-        front_indices = np.where(
-            (angles >= len(ranges) * (self.MIN_FRONT_ANGLE + 180) / 360) &
-            (angles <= len(ranges) * (self.MAX_FRONT_ANGLE + 180) / 360)
-        )[0]
-        
-        front_ranges = np.array(ranges)[front_indices]
-        valid_ranges = front_ranges[(front_ranges > 0.12) & (front_ranges < 3.5)]
-        
-        return np.min(valid_ranges) if len(valid_ranges) > 0 else float('inf')
+    def robot_lidar_callback(self, msg):
+        # Robust LIDAR data preprocessing
+        ranges = np.array(msg.ranges)
 
-    def log_status(self):
-        """Log robot status if enough time has passed"""
-        current_time = time.time()
-        if current_time - self.last_log_time >= self.LOG_INTERVAL:
-            self.last_log_time = current_time
-            
-            # Log LiDAR readings
-            if self.latest_lidar_readings is not None:
-                logger.info(
-                    f"LiDAR Status - "
-                    f"Front: {self.latest_front_distance:.2f}m, "
-                    f"State: {'Turning' if self.is_turning else 'Forward'}, "
-                    f"Direction: {self.turn_direction if self.turn_direction else 'None'}"
+        # Replace NaN and inf with maximum sensor range
+        ranges = np.nan_to_num(ranges, nan=3.5, posinf=3.5, neginf=3.5)
+
+        # Filter out extreme or invalid ranges
+        ranges = np.clip(ranges, 0.1, 3.5)
+
+        self.laserscan = ranges
+        self.lidar_available = True
+
+    def robot_controller_callback(self):
+        DELAY = 4.0  # Time delay (s)
+        if self.get_clock().now() - self.start_time > Duration(seconds=DELAY):
+            if self.lidar_available and self.laserscan is not None:
+                # Dynamically calculate scan parameters
+                scan_length = len(self.laserscan)
+                step_size = 360.0 / scan_length
+
+                # Safe sector calculation
+                front_sector = max(1, int(30 / step_size))  # Wider front sector
+                side_sector = max(1, int(45 / step_size))  # Wider side sector
+
+                # Robust distance calculations
+                def safe_mean(arr):
+                    valid_ranges = arr[np.isfinite(arr)]
+                    return np.mean(valid_ranges) if len(valid_ranges) > 0 else 3.5
+
+                # More granular obstacle detection
+                front_left = safe_mean(self.laserscan[: int(scan_length / 4)])
+                front_right = safe_mean(self.laserscan[-int(scan_length / 4) :])
+                front_center = safe_mean(
+                    np.concatenate(
+                        [self.laserscan[:front_sector], self.laserscan[-front_sector:]]
+                    )
                 )
-            
-            # Log latest model response if available
-            if self.latest_model_response:
-                logger.info(f"Last Model Analysis - {self.latest_model_response}")
 
-    def analyze_obstacle(self):
-        """Use the model to analyze the obstacle type and get turning direction"""
-        if self.last_image is None:
-            logger.error("No image available for analysis")
-            return None, None
+                # Additional side and diagonal sectors
+                left_side = safe_mean(
+                    self.laserscan[int(scan_length / 4) : int(scan_length / 2)]
+                )
+                right_side = safe_mean(
+                    self.laserscan[int(scan_length / 2) : int(3 * scan_length / 4)]
+                )
 
-        try:
-            # Convert image to bytes
-            _, buffer = cv2.imencode('.jpg', self.last_image)
-            image_bytes = buffer.tobytes()
+                # Timestamp for PID
+                tstamp = time.time()
 
-            # Get model's analysis
-            response = self.ollama_client.generate(
-                model=self.model_name,
-                prompt="Is this obstacle another robot or a track wall? If wall, which direction should I turn?",
-                images=[image_bytes],
-                keep_alive=True
-            )
+                # More aggressive obstacle detection thresholds
+                FRONT_OBSTACLE_THRESHOLD = 0.7  # Larger threshold for front
+                SIDE_OBSTACLE_THRESHOLD = 0.5  # Smaller threshold for sides
 
-            # Parse response
-            import re
-            type_match = re.search(r'<type>(.*?)</type>', response.response)
-            direction_match = re.search(r'<direction>(.*?)</direction>', response.response)
+                # Debugging print statements
+                print(
+                    f"Distances - Front: {front_center:.2f}, Left: {front_left:.2f}, Right: {front_right:.2f}, Side-Left: {left_side:.2f}, Side-Right: {right_side:.2f}"
+                )
 
-            obstacle_type = type_match.group(1) if type_match else None
-            turn_direction = direction_match.group(1) if direction_match else None
+                # Advanced Obstacle Avoidance Logic
+                if (
+                    front_center < FRONT_OBSTACLE_THRESHOLD
+                    or front_left < FRONT_OBSTACLE_THRESHOLD
+                    or front_right < FRONT_OBSTACLE_THRESHOLD
+                ):
+                    # Obstacle directly in front or on sides
+                    if front_left > front_right:
+                        # More space on left, turn right
+                        LIN_VEL = 0.05  # Very slow forward movement
+                        ANG_VEL = -1.2  # Strong right turn
+                        print("OBSTACLE AHEAD: Turning Right")
+                    else:
+                        # More space on right, turn left
+                        LIN_VEL = 0.05  # Very slow forward movement
+                        ANG_VEL = 1.2  # Strong left turn
+                        print("OBSTACLE AHEAD: Turning Left")
 
-            # Store the latest model response
-            self.latest_model_response = f"Type: {obstacle_type}, Direction: {turn_direction}"
+                elif (
+                    left_side < SIDE_OBSTACLE_THRESHOLD
+                    or right_side < SIDE_OBSTACLE_THRESHOLD
+                ):
+                    # Obstacles on sides
+                    if left_side < SIDE_OBSTACLE_THRESHOLD:
+                        # Obstacle on left, turn right
+                        LIN_VEL = 0.1
+                        ANG_VEL = -0.8
+                        print("SIDE OBSTACLE: Turning Right")
+                    else:
+                        # Obstacle on right, turn left
+                        LIN_VEL = 0.1
+                        ANG_VEL = 0.8
+                        print("SIDE OBSTACLE: Turning Left")
 
-            return obstacle_type, turn_direction
+                else:
+                    # Normal wall following with more aggressive correction
+                    LIN_VEL = 0.2
+                    ANG_VEL = self.pid_1_lat.control(
+                        (left_side - right_side) * 2.0,  # Increased sensitivity
+                        tstamp,
+                    )
+                    print("Wall Following")
 
-        except Exception as e:
-            logger.error(f"Error in obstacle analysis: {str(e)}")
-            return None, None
+                # Velocity Limits
+                self.ctrl_msg.linear.x = min(0.22, float(LIN_VEL))
+                self.ctrl_msg.angular.z = min(2.84, float(ANG_VEL))
 
-    def lidar_callback(self, msg):
-        """Process LiDAR data and control the robot"""
-        # Store latest LiDAR readings
-        self.latest_lidar_readings = msg.ranges
-        self.latest_front_distance = self.get_front_distance(msg.ranges)
+                # Publish control message
+                self.robot_ctrl_pub.publish(self.ctrl_msg)
+        else:
+            print("Initializing...")
 
-        # Log status periodically
-        self.log_status()
 
-        if self.is_turning:
-            # Continue turning until front is clear
-            if self.latest_front_distance > self.FRONT_OBSTACLE_THRESHOLD:
-                self.is_turning = False
-                self.turn_direction = None
-                self.obstacle_detected = False
-            else:
-                # Continue turning in the same direction
-                self.execute_turn()
-            return
+def main(args=None):
+    rclpy.init(args=args)
+    node = RobotController()
+    rclpy.spin(node)
+    node.destroy_node()
+    rclpy.shutdown()
 
-        # Check for obstacles in front
-        if self.latest_front_distance <= self.FRONT_OBSTACLE_THRESHOLD and not self.obstacle_detected:
-            # New obstacle detected
-            self.obstacle_detected = True
-            # Stop the robot
-            self.publish_stop()
-            
-            # Analyze obstacle
-            obstacle_type, turn_direction = self.analyze_obstacle()
-            
-            if obstacle_type == 'wall' and turn_direction in ['left', 'right']:
-                self.is_turning = True
-                self.turn_direction = turn_direction
-                logger.info(f"Wall detected, turning {turn_direction}")
-                self.execute_turn()
-            elif obstacle_type == 'robot':
-                logger.info("Robot detected, waiting...")
-                self.publish_stop()
-            else:
-                logger.warning("Unclear obstacle analysis, stopping")
-                self.publish_stop()
-        
-        elif self.latest_front_distance > self.FRONT_OBSTACLE_THRESHOLD:
-            # Clear path ahead
-            self.move_forward()
 
-    def execute_turn(self):
-        """Execute the turning movement"""
-        cmd = Twist()
-        if self.turn_direction == 'left':
-            cmd.angular.z = self.TURNING_SPEED
-        else:  # right
-            cmd.angular.z = -self.TURNING_SPEED
-        self.control_publisher.publish(cmd)
-
-    def move_forward(self):
-        """Move the robot forward"""
-        cmd = Twist()
-        cmd.linear.x = self.FORWARD_SPEED
-        self.control_publisher.publish(cmd)
-
-    def publish_stop(self):
-        """Stop the robot"""
-        self.control_publisher.publish(Twist())
-
-def main():
-    rclpy.init()
-
-    model_name = "llava:7b"
-    model_prompt = (
-        """
-        You are analyzing obstacles in a robot race track.
-        Identify if the obstacle is another robot or a track wall/obstacle.
-        If it's a wall, suggest which direction to turn (left or right) based on the track layout.
-        Format response as: <type>robot/wall</type><direction>left/right</direction>
-        """
-    )
-
-    controller = RobotController(model_name, model_prompt)
-    
-    try:
-        rclpy.spin(controller)
-    except KeyboardInterrupt:
-        logger.info("KeyboardInterrupt detected, stopping robot...")
-        stop_cmd = Twist()
-        controller.control_publisher.publish(stop_cmd)
-        time.sleep(0.5)
-    finally:
-        controller.destroy_node()
-        rclpy.shutdown()
-        logger.info("Shutting down Robot Controller Node")
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
