@@ -68,9 +68,9 @@ class RobotController(Node):
         timer_period = 0.001  # Node execution time period (seconds)
         self.timer = self.create_timer(timer_period, self.robot_controller_callback)
 
-        # PID Controllers
-        self.pid_1_lat = PIDController(0.3, 0.01, 0.1, 10)
-        self.pid_1_lon = PIDController(0.1, 0.001, 0.005, 10)
+        # PID Controllers - Increased gains for more aggressive control
+        self.pid_1_lat = PIDController(0.5, 0.02, 0.15, 10)  # More aggressive lateral control
+        self.pid_1_lon = PIDController(0.2, 0.002, 0.01, 10)  # More aggressive longitudinal control
 
         # State variables
         self.lidar_available = False
@@ -79,6 +79,11 @@ class RobotController(Node):
         self.start_time = self.get_clock().now()
         self.ctrl_msg = Twist()
         self.prefer_left_turns = True
+
+        # Robot physical parameters
+        self.robot_width = 0.20  # Robot width in meters
+        self.robot_length = 0.20  # Robot length in meters
+        self.safety_margin = 0.10  # Safety margin in meters
 
     def robot_lidar_callback(self, msg):
         # Robust LIDAR data preprocessing
@@ -94,7 +99,7 @@ class RobotController(Node):
         self.lidar_available = True
 
     def robot_controller_callback(self):
-        DELAY = 4.0  # Time delay (s)
+        DELAY = 2.0  # Reduced initialization delay for racing
         if self.get_clock().now() - self.start_time > Duration(seconds=DELAY):
             if self.lidar_available and self.laserscan is not None:
                 # Dynamically calculate scan parameters
@@ -130,66 +135,62 @@ class RobotController(Node):
                 # Timestamp for PID
                 tstamp = time.time()
 
-                # More aggressive obstacle detection thresholds
-                FRONT_OBSTACLE_THRESHOLD = 0.7  # Larger threshold for front
-                SIDE_OBSTACLE_THRESHOLD = 0.5  # Smaller threshold for sides
+                # Adjusted thresholds considering robot size
+                FRONT_OBSTACLE_THRESHOLD = 0.5  # Reduced from 0.7 for more aggressive approach
+                SIDE_OBSTACLE_THRESHOLD = self.robot_width/2 + self.safety_margin  # About 0.3m
+                RACING_DISTANCE = 0.4  # Optimal distance from wall for racing
 
                 # Debugging print statements
                 print(
                     f"Distances - Front: {front_center:.2f}, Left: {front_left:.2f}, Right: {front_right:.2f}, Side-Left: {left_side:.2f}, Side-Right: {right_side:.2f}"
                 )
 
-                # Advanced Obstacle Avoidance Logic
-                if (
-                    front_center < FRONT_OBSTACLE_THRESHOLD
-                    or front_left < FRONT_OBSTACLE_THRESHOLD
-                    or front_right < FRONT_OBSTACLE_THRESHOLD
-                ):
-                    # Obstacle directly in front or on sides
-                    if (front_left > front_right) == self.prefer_left_turns:
-                        # Turn left if more space on left (and preferring left) or more space on right (and preferring right)
-                        LIN_VEL = 0.05  # Very slow forward movement
-                        ANG_VEL = 1.2  # Strong left turn
-                        print("OBSTACLE AHEAD: Turning Left")
+                # Enhanced Racing Logic
+                if front_center < FRONT_OBSTACLE_THRESHOLD:
+                    # Emergency obstacle avoidance
+                    if front_left > front_right:
+                        LIN_VEL = 0.1  # Increased from 0.05 for more aggressive turning
+                        ANG_VEL = 1.5  # Increased from 1.2 for sharper turns
+                        print("EMERGENCY: Sharp Left Turn")
                     else:
-                        # Turn right if more space on right (and preferring left) or more space on left (and preferring right)
-                        LIN_VEL = 0.05  # Very slow forward movement
-                        ANG_VEL = -1.2  # Strong right turn
-                        print("OBSTACLE AHEAD: Turning Right")
+                        LIN_VEL = 0.1
+                        ANG_VEL = -1.5
+                        print("EMERGENCY: Sharp Right Turn")
 
-                elif (
-                    left_side < SIDE_OBSTACLE_THRESHOLD
-                    or right_side < SIDE_OBSTACLE_THRESHOLD
-                ):
-                    # Obstacles on sides
+                elif left_side < SIDE_OBSTACLE_THRESHOLD or right_side < SIDE_OBSTACLE_THRESHOLD:
+                    # Side obstacle avoidance with racing optimization
                     if left_side < SIDE_OBSTACLE_THRESHOLD:
-                        # Obstacle on left, turn right
-                        LIN_VEL = 0.1
-                        ANG_VEL = -0.8
-                        print("SIDE OBSTACLE: Turning Right")
+                        LIN_VEL = 0.15  # Increased from 0.1
+                        ANG_VEL = -1.0  # Increased from -0.8
+                        print("RACING: Avoiding Left Wall")
                     else:
-                        # Obstacle on right, turn left
-                        LIN_VEL = 0.1
-                        ANG_VEL = 0.8
-                        print("SIDE OBSTACLE: Turning Left")
+                        LIN_VEL = 0.15
+                        ANG_VEL = 1.0
+                        print("RACING: Avoiding Right Wall")
 
                 else:
-                    # Normal wall following with more aggressive correction
-                    LIN_VEL = 0.2
+                    # Optimized racing behavior
+                    target_error = (left_side - RACING_DISTANCE) if self.prefer_left_turns else (right_side - RACING_DISTANCE)
+                    
+                    # Dynamic velocity based on path curvature
+                    curve_factor = abs(target_error) * 2.0
+                    LIN_VEL = 0.3 * (1.0 - min(curve_factor, 0.5))  # Max speed 0.3 m/s
+                    
+                    # More aggressive turning for optimal racing line
                     ANG_VEL = self.pid_1_lat.control(
-                        (left_side - right_side) * 2.0,  # Increased sensitivity
-                        tstamp,
+                        target_error * 2.5,  # Increased sensitivity for racing
+                        time.time()
                     )
-                    print("Wall Following")
+                    print("RACING: Optimal Line")
 
-                # Velocity Limits
-                self.ctrl_msg.linear.x = min(0.22, float(LIN_VEL))
-                self.ctrl_msg.angular.z = min(2.84, float(ANG_VEL))
+                # Updated Velocity Limits for Racing
+                self.ctrl_msg.linear.x = min(0.3, max(0.05, float(LIN_VEL)))  # Increased max speed
+                self.ctrl_msg.angular.z = min(3.0, max(-3.0, float(ANG_VEL)))  # Increased max turn rate
 
                 # Publish control message
                 self.robot_ctrl_pub.publish(self.ctrl_msg)
         else:
-            print("Initializing...")
+            print("Race preparation...")
 
 
 def main(args=None):
