@@ -1,7 +1,7 @@
 # ROS2 module imports
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import Twist, Point
 from sensor_msgs.msg import LaserScan
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 from rclpy.qos import qos_profile_sensor_data
@@ -11,48 +11,73 @@ from rclpy.duration import Duration
 import numpy as np
 import queue
 import time
+from collections import deque
+from enum import Enum
 
+class NavigationState(Enum):
+    EXPLORING = 1
+    OBSTACLE_AVOIDANCE = 2
+    WALL_FOLLOWING = 3
+    BACKTRACKING = 4
 
 class PIDController:
     def __init__(self, kP, kI, kD, kS):
-        self.kP = kP  # Proportional gain
-        self.kI = kI  # Integral gain
-        self.kD = kD  # Derivative gain
-        self.kS = kS  # Saturation constant (error history buffer size)
-        self.err_int = 0  # Error integral
-        self.err_dif = 0  # Error difference
-        self.err_prev = 0  # Previous error
-        self.err_hist = queue.Queue(self.kS)  # Limited buffer of error history
-        self.t_prev = 0  # Previous time
+        self.kP = kP
+        self.kI = kI
+        self.kD = kD
+        self.kS = kS
+        self.err_int = 0
+        self.err_dif = 0
+        self.err_prev = 0
+        self.err_hist = queue.Queue(self.kS)
+        self.t_prev = 0
+
+    def reset(self):
+        self.err_int = 0
+        self.err_dif = 0
+        self.err_prev = 0
+        self.err_hist = queue.Queue(self.kS)
+        self.t_prev = 0
 
     def control(self, err, t):
-        dt = t - self.t_prev  # Timestep
+        dt = t - self.t_prev
         if dt > 0.0:
-            self.err_hist.put(err)  # Update error history
-            self.err_int += err  # Integrate error
-            if self.err_hist.full():  # Jacketing logic to prevent integral windup
-                self.err_int -= self.err_hist.get()  # Rolling FIFO buffer
-            self.err_dif = err - self.err_prev  # Error difference
-            u = (
-                (self.kP * err)
-                + (self.kI * self.err_int * dt)
-                + (self.kD * self.err_dif / dt)
-            )  # PID control law
-            self.err_prev = err  # Update previous error term
-            self.t_prev = t  # Update timestamp
-            return u  # Control signal
+            self.err_hist.put(err)
+            self.err_int += err
+            if self.err_hist.full():
+                self.err_int -= self.err_hist.get()
+            self.err_dif = err - self.err_prev
+            u = (self.kP * err) + (self.kI * self.err_int * dt) + (self.kD * self.err_dif / dt)
+            self.err_prev = err
+            self.t_prev = t
+            return u
         return 0
 
+class ObstacleMemory:
+    def __init__(self, memory_size=100):
+        self.memory_size = memory_size
+        self.obstacles = deque(maxlen=memory_size)
+        self.last_position = Point()
+        
+    def add_obstacle(self, position, distance):
+        self.obstacles.append((position, distance, time.time()))
+        
+    def get_nearby_obstacles(self, current_position, threshold=1.0):
+        recent_obstacles = []
+        current_time = time.time()
+        for obs in self.obstacles:
+            if current_time - obs[2] < 10.0:  # Only consider obstacles detected in last 10 seconds
+                distance = np.sqrt((current_position.x - obs[0].x)**2 + 
+                                 (current_position.y - obs[0].y)**2)
+                if distance < threshold:
+                    recent_obstacles.append(obs)
+        return recent_obstacles
 
 class RobotController(Node):
     def __init__(self):
-        # Information and debugging
-        info = "\nMake the robot follow wall, avoid obstacles, follow line, detect stop sign and track AprilTag marker.\n"
-        print(info)
-
-        # ROS2 infrastructure
         super().__init__("robot_controller")
-
+        
+        # ROS2 infrastructure setup
         qos_profile = QoSProfile(
             reliability=QoSReliabilityPolicy.RMW_QOS_POLICY_RELIABILITY_RELIABLE,
             history=QoSHistoryPolicy.RMW_QOS_POLICY_HISTORY_KEEP_LAST,
@@ -62,135 +87,114 @@ class RobotController(Node):
         self.robot_lidar_sub = self.create_subscription(
             LaserScan, "/scan", self.robot_lidar_callback, qos_profile_sensor_data
         )
-
         self.robot_ctrl_pub = self.create_publisher(Twist, "/cmd_vel", qos_profile)
-
-        timer_period = 0.001  # Node execution time period (seconds)
+        
+        # Controllers and parameters
+        self.pid_wall = PIDController(0.5, 0.01, 0.1, 10)  # Wall following
+        self.pid_obstacle = PIDController(0.8, 0.0, 0.2, 10)  # Obstacle avoidance
+        
+        # Navigation state
+        self.current_state = NavigationState.EXPLORING
+        self.obstacle_memory = ObstacleMemory()
+        self.position = Point()
+        self.orientation = 0.0
+        self.stuck_counter = 0
+        self.last_positions = deque(maxlen=50)
+        
+        # Timer setup
+        timer_period = 0.05  # 20Hz control loop
         self.timer = self.create_timer(timer_period, self.robot_controller_callback)
-
-        # PID Controllers
-        self.pid_1_lat = PIDController(0.3, 0.01, 0.1, 10)
-        self.pid_1_lon = PIDController(0.1, 0.001, 0.005, 10)
-
+        
         # State variables
         self.lidar_available = False
         self.laserscan = None
-        self.start_mode = "outside"
-        self.start_time = self.get_clock().now()
         self.ctrl_msg = Twist()
-        self.prefer_left_turns = True
-
+        
     def robot_lidar_callback(self, msg):
-        # Robust LIDAR data preprocessing
         ranges = np.array(msg.ranges)
-
-        # Replace NaN and inf with maximum sensor range
         ranges = np.nan_to_num(ranges, nan=3.5, posinf=3.5, neginf=3.5)
-
-        # Filter out extreme or invalid ranges
         ranges = np.clip(ranges, 0.1, 3.5)
-
         self.laserscan = ranges
         self.lidar_available = True
+        
+    def update_position(self, linear_vel, angular_vel, dt):
+        # Simple odometry update
+        self.orientation += angular_vel * dt
+        self.position.x += linear_vel * np.cos(self.orientation) * dt
+        self.position.y += linear_vel * np.sin(self.orientation) * dt
+        self.last_positions.append((self.position.x, self.position.y))
+        
+    def check_if_stuck(self):
+        if len(self.last_positions) < 50:
+            return False
+        
+        positions = np.array(list(self.last_positions))
+        variance = np.var(positions, axis=0)
+        return np.sum(variance) < 0.01  # Threshold for determining if stuck
+        
+    def get_sector_distances(self):
+        if not self.lidar_available or self.laserscan is None:
+            return None
+            
+        scan_length = len(self.laserscan)
+        sectors = {
+            'front': np.mean(np.concatenate([self.laserscan[:int(scan_length/8)], 
+                                           self.laserscan[-int(scan_length/8):]]), axis=0),
+            'front_left': np.mean(self.laserscan[int(scan_length/8):int(scan_length/4)]),
+            'left': np.mean(self.laserscan[int(scan_length/4):int(scan_length/2)]),
+            'right': np.mean(self.laserscan[int(scan_length/2):int(3*scan_length/4)]),
+            'front_right': np.mean(self.laserscan[int(3*scan_length/4):int(7*scan_length/8)])
+        }
+        return sectors
 
     def robot_controller_callback(self):
-        DELAY = 4.0  # Time delay (s)
-        if self.get_clock().now() - self.start_time > Duration(seconds=DELAY):
-            if self.lidar_available and self.laserscan is not None:
-                # Dynamically calculate scan parameters
-                scan_length = len(self.laserscan)
-                step_size = 360.0 / scan_length
+        if not self.lidar_available:
+            return
 
-                # Safe sector calculation
-                front_sector = max(1, int(30 / step_size))  # Wider front sector
-                side_sector = max(1, int(45 / step_size))  # Wider side sector
+        sectors = self.get_sector_distances()
+        if sectors is None:
+            return
 
-                # Robust distance calculations
-                def safe_mean(arr):
-                    valid_ranges = arr[np.isfinite(arr)]
-                    return np.mean(valid_ranges) if len(valid_ranges) > 0 else 3.5
-
-                # More granular obstacle detection
-                front_left = safe_mean(self.laserscan[: int(scan_length / 4)])
-                front_right = safe_mean(self.laserscan[-int(scan_length / 4) :])
-                front_center = safe_mean(
-                    np.concatenate(
-                        [self.laserscan[:front_sector], self.laserscan[-front_sector:]]
-                    )
-                )
-
-                # Additional side and diagonal sectors
-                left_side = safe_mean(
-                    self.laserscan[int(scan_length / 4) : int(scan_length / 2)]
-                )
-                right_side = safe_mean(
-                    self.laserscan[int(scan_length / 2) : int(3 * scan_length / 4)]
-                )
-
-                # Timestamp for PID
-                tstamp = time.time()
-
-                # More aggressive obstacle detection thresholds
-                FRONT_OBSTACLE_THRESHOLD = 0.7  # Larger threshold for front
-                SIDE_OBSTACLE_THRESHOLD = 0.5  # Smaller threshold for sides
-
-                # Debugging print statements
-                print(
-                    f"Distances - Front: {front_center:.2f}, Left: {front_left:.2f}, Right: {front_right:.2f}, Side-Left: {left_side:.2f}, Side-Right: {right_side:.2f}"
-                )
-
-                # Advanced Obstacle Avoidance Logic
-                if (
-                    front_center < FRONT_OBSTACLE_THRESHOLD
-                    or front_left < FRONT_OBSTACLE_THRESHOLD
-                    or front_right < FRONT_OBSTACLE_THRESHOLD
-                ):
-                    # Obstacle directly in front or on sides
-                    if (front_left > front_right) == self.prefer_left_turns:
-                        # Turn left if more space on left (and preferring left) or more space on right (and preferring right)
-                        LIN_VEL = 0.05  # Very slow forward movement
-                        ANG_VEL = 1.2  # Strong left turn
-                        print("OBSTACLE AHEAD: Turning Left")
-                    else:
-                        # Turn right if more space on right (and preferring left) or more space on left (and preferring right)
-                        LIN_VEL = 0.05  # Very slow forward movement
-                        ANG_VEL = -1.2  # Strong right turn
-                        print("OBSTACLE AHEAD: Turning Right")
-
-                elif (
-                    left_side < SIDE_OBSTACLE_THRESHOLD
-                    or right_side < SIDE_OBSTACLE_THRESHOLD
-                ):
-                    # Obstacles on sides
-                    if left_side < SIDE_OBSTACLE_THRESHOLD:
-                        # Obstacle on left, turn right
-                        LIN_VEL = 0.1
-                        ANG_VEL = -0.8
-                        print("SIDE OBSTACLE: Turning Right")
-                    else:
-                        # Obstacle on right, turn left
-                        LIN_VEL = 0.1
-                        ANG_VEL = 0.8
-                        print("SIDE OBSTACLE: Turning Left")
-
-                else:
-                    # Normal wall following with more aggressive correction
-                    LIN_VEL = 0.2
-                    ANG_VEL = self.pid_1_lat.control(
-                        (left_side - right_side) * 2.0,  # Increased sensitivity
-                        tstamp,
-                    )
-                    print("Wall Following")
-
-                # Velocity Limits
-                self.ctrl_msg.linear.x = min(0.22, float(LIN_VEL))
-                self.ctrl_msg.angular.z = min(2.84, float(ANG_VEL))
-
-                # Publish control message
-                self.robot_ctrl_pub.publish(self.ctrl_msg)
+        # Update stuck detection
+        if self.check_if_stuck():
+            self.stuck_counter += 1
+            if self.stuck_counter > 20:  # Stuck for 1 second
+                self.current_state = NavigationState.BACKTRACKING
         else:
-            print("Initializing...")
+            self.stuck_counter = 0
 
+        # State machine for navigation
+        if self.current_state == NavigationState.BACKTRACKING:
+            # Perform recovery behavior
+            self.ctrl_msg.linear.x = -0.1
+            self.ctrl_msg.angular.z = 0.5
+            if not self.check_if_stuck():
+                self.current_state = NavigationState.EXPLORING
+                self.pid_wall.reset()
+                self.pid_obstacle.reset()
+
+        elif sectors['front'] < 0.5 or sectors['front_left'] < 0.4 or sectors['front_right'] < 0.4:
+            # Obstacle avoidance state
+            self.current_state = NavigationState.OBSTACLE_AVOIDANCE
+            turn_direction = 1.0 if sectors['front_left'] > sectors['front_right'] else -1.0
+            self.ctrl_msg.linear.x = 0.05
+            self.ctrl_msg.angular.z = turn_direction * 0.8
+
+        elif self.current_state == NavigationState.EXPLORING:
+            # Normal exploration with wall following
+            target_wall_distance = 0.6
+            wall_error = target_wall_distance - min(sectors['left'], sectors['right'])
+            
+            self.ctrl_msg.linear.x = 0.2
+            self.ctrl_msg.angular.z = self.pid_wall.control(wall_error, time.time())
+
+        # Apply velocity limits
+        self.ctrl_msg.linear.x = np.clip(self.ctrl_msg.linear.x, -0.22, 0.22)
+        self.ctrl_msg.angular.z = np.clip(self.ctrl_msg.angular.z, -2.84, 2.84)
+        
+        # Update position estimate and publish control
+        self.update_position(self.ctrl_msg.linear.x, self.ctrl_msg.angular.z, 0.05)
+        self.robot_ctrl_pub.publish(self.ctrl_msg)
 
 def main(args=None):
     rclpy.init(args=args)
@@ -198,7 +202,6 @@ def main(args=None):
     rclpy.spin(node)
     node.destroy_node()
     rclpy.shutdown()
-
 
 if __name__ == "__main__":
     main()
