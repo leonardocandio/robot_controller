@@ -85,7 +85,7 @@ class RobotController(Node):
         # Add camera subscriber for detecting boxes/walls
         self.camera_sub = self.create_subscription(
             Image, 
-            '/camera/image_raw', 
+            '/image_raw', 
             self.camera_callback,
             qos_profile_sensor_data
         )
