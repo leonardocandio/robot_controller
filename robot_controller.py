@@ -223,6 +223,10 @@ class RobotController(Node):
                 # Timestamp for PID
                 tstamp = time.time()
 
+                # Initialize velocity variables with safe defaults
+                LIN_VEL = 0.0
+                ANG_VEL = 0.0
+
                 # Check if we're in a critical situation (too close to obstacles)
                 in_critical_situation = (front_min < self.CRITICAL_DISTANCE or 
                                        sides_min < self.CRITICAL_DISTANCE/2)
