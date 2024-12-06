@@ -77,6 +77,19 @@ class RobotController(Node):
         self.start_time = self.get_clock().now()
         self.ctrl_msg = Twist()
         self.prefer_left_turns = True
+        
+        # Robot physical parameters (in meters)
+        self.ROBOT_WIDTH = 0.20
+        self.ROBOT_LENGTH = 0.20
+        self.SAFETY_MARGIN = 0.10  # Additional safety margin around robot
+        
+        # Obstacle avoidance parameters
+        self.CRITICAL_DISTANCE = self.ROBOT_WIDTH/2 + self.SAFETY_MARGIN  # Distance at which to stop
+        self.SAFE_DISTANCE = self.CRITICAL_DISTANCE + 0.15  # Distance at which to start avoiding
+        self.stuck_time = None
+        self.recovery_turn_direction = 1  # 1 for left, -1 for right
+        self.consecutive_stops = 0
+        self.last_movement_time = time.time()
 
         # Camera subscription
         self.camera_sub = self.create_subscription(
@@ -91,6 +104,10 @@ class RobotController(Node):
         self.latest_image = None
         self.path_detected = False
         self.path_center = 0
+        self.split_detected = False
+        self.chosen_path = None
+        self.last_good_path = None
+        self.split_decision_time = None
 
     def robot_lidar_callback(self, msg):
         # Robust LIDAR data preprocessing
@@ -105,6 +122,7 @@ class RobotController(Node):
         try:
             # Convert ROS Image message to OpenCV format
             cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            height, width = cv_image.shape[:2]
             
             # Convert to grayscale
             gray = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
@@ -112,17 +130,59 @@ class RobotController(Node):
             # Apply threshold to isolate the path
             _, binary = cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY_INV)
             
-            # Get the bottom portion of the image where the path is most visible
-            height = binary.shape[0]
-            roi = binary[int(height*0.7):height, :]
+            # Define multiple ROIs for path detection
+            roi_bottom = binary[int(height*0.8):height, :]
+            roi_middle = binary[int(height*0.6):int(height*0.8), :]
+            roi_top = binary[int(height*0.4):int(height*0.6), :]
             
-            # Find the center of the path
-            M = cv2.moments(roi)
-            if M["m00"] > 0:
-                self.path_center = int(M["m10"] / M["m00"])
-                self.path_detected = True
+            # Find contours in each ROI
+            contours_bottom, _ = cv2.findContours(roi_bottom, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            contours_middle, _ = cv2.findContours(roi_middle, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            contours_top, _ = cv2.findContours(roi_top, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            # Detect split in path
+            self.split_detected = len(contours_middle) > 1 or len(contours_top) > 1
+            
+            # Process bottom ROI for immediate steering
+            if contours_bottom:
+                largest_contour = max(contours_bottom, key=cv2.contourArea)
+                M = cv2.moments(largest_contour)
+                if M["m00"] > 0:
+                    current_center = int(M["m10"] / M["m00"])
+                    
+                    # If we detect a split and haven't made a decision yet
+                    if self.split_detected and self.chosen_path is None:
+                        current_time = time.time()
+                        if self.split_decision_time is None:
+                            self.split_decision_time = current_time
+                            # Make a decision based on prefer_left_turns
+                            if self.prefer_left_turns:
+                                self.chosen_path = 'left'
+                            else:
+                                self.chosen_path = 'right'
+                    
+                    # Apply the path decision
+                    if self.chosen_path == 'left':
+                        target_x = width * 0.3  # Aim for left side
+                    elif self.chosen_path == 'right':
+                        target_x = width * 0.7  # Aim for right side
+                    else:
+                        target_x = width * 0.5  # Aim for center
+                    
+                    # Update path center with bias towards chosen direction
+                    self.path_center = int(0.7 * current_center + 0.3 * target_x)
+                    self.path_detected = True
+                    self.last_good_path = self.path_center
+                    
+                    # Reset split decision after passing through
+                    if not self.split_detected and self.chosen_path is not None:
+                        self.chosen_path = None
+                        self.split_decision_time = None
+                
             else:
                 self.path_detected = False
+                if self.last_good_path is not None:
+                    self.path_center = self.last_good_path
                 
         except Exception as e:
             self.get_logger().error(f'Error processing image: {str(e)}')
@@ -136,105 +196,115 @@ class RobotController(Node):
                 scan_length = len(self.laserscan)
                 step_size = 360.0 / scan_length
 
-                # Safe sector calculation
-                front_sector = max(1, int(30 / step_size))
-                side_sector = max(1, int(45 / step_size))
+                # Enhanced sector calculations for better coverage
+                front_sector = max(1, int(45 / step_size))  # Increased from 30 to 45 degrees
+                side_sector = max(1, int(60 / step_size))   # Increased from 45 to 60 degrees
 
                 def safe_mean(arr):
                     valid_ranges = arr[np.isfinite(arr)]
                     return np.mean(valid_ranges) if len(valid_ranges) > 0 else 3.5
 
-                # Compute distances in various directions
-                front_left = safe_mean(self.laserscan[: int(scan_length / 4)])
-                front_right = safe_mean(self.laserscan[-int(scan_length / 4):])
+                # Compute distances with more detailed sectors
                 front_center = safe_mean(
                     np.concatenate([self.laserscan[:front_sector], self.laserscan[-front_sector:]])
                 )
-                left_side = safe_mean(self.laserscan[int(scan_length / 4): int(scan_length / 2)])
-                right_side = safe_mean(self.laserscan[int(scan_length / 2): int(3 * scan_length / 4)])
+                front_left = safe_mean(self.laserscan[front_sector:front_sector*2])
+                front_right = safe_mean(self.laserscan[-front_sector*2:-front_sector])
+                left_side = safe_mean(self.laserscan[int(scan_length/4):int(scan_length/2)])
+                right_side = safe_mean(self.laserscan[int(scan_length/2):int(3*scan_length/4)])
+
+                # Find minimum distances in critical sectors
+                front_min = min(
+                    np.min(self.laserscan[:front_sector]),
+                    np.min(self.laserscan[-front_sector:])
+                )
+                sides_min = min(
+                    np.min(self.laserscan[int(scan_length/4):int(3*scan_length/4)])
+                )
 
                 # Timestamp for PID
                 tstamp = time.time()
 
-                # Thresholds (unchanged)
-                FRONT_OBSTACLE_THRESHOLD = 0.7
-                SIDE_OBSTACLE_THRESHOLD = 0.5
+                # Check if we're in a critical situation (too close to obstacles)
+                in_critical_situation = (front_min < self.CRITICAL_DISTANCE or 
+                                       sides_min < self.CRITICAL_DISTANCE/2)
 
-                # Debugging print
-                print(
-                    f"Distances - Front: {front_center:.2f}, Left: {front_left:.2f}, Right: {front_right:.2f}, Side-Left: {left_side:.2f}, Side-Right: {right_side:.2f}"
-                )
-
-                # Enhanced decision logic with camera input
-                if self.path_detected:
-                    # Use path center to influence turning decision
-                    image_width = 640  # Adjust based on your camera resolution
-                    path_error = (image_width/2 - self.path_center) / (image_width/2)  # Normalized error
-                    
-                    if abs(path_error) > 0.2:  # If path significantly deviates from center
-                        # Adjust angular velocity based on path position
-                        ANG_VEL = self.pid_1_lat.control(path_error * 1.5, tstamp)
-                        LIN_VEL = 0.15  # Reduce speed during turns
-                        print(f"Path correction: error={path_error:.2f}")
-                    else:
-                        # Path is centered, proceed with LIDAR-based wall following
-                        if (front_center < FRONT_OBSTACLE_THRESHOLD or
-                            front_left < FRONT_OBSTACLE_THRESHOLD or
-                            front_right < FRONT_OBSTACLE_THRESHOLD):
-                            # Original obstacle avoidance logic
-                            if (front_left > front_right) == self.prefer_left_turns:
-                                LIN_VEL = 0.05
-                                ANG_VEL = 1.2
-                                print("OBSTACLE AHEAD: Turning Left")
-                            else:
-                                LIN_VEL = 0.05
-                                ANG_VEL = -1.2
-                                print("OBSTACLE AHEAD: Turning Right")
-                        else:
-                            # Normal operation
-                            LIN_VEL = 0.22
-                            ANG_VEL = self.pid_1_lat.control((left_side - right_side) * 2.0, tstamp)
+                # Check if we're stuck (no movement for too long)
+                if in_critical_situation:
+                    if self.stuck_time is None:
+                        self.stuck_time = time.time()
+                        self.consecutive_stops += 1
+                    elif time.time() - self.stuck_time > 2.0:  # Stuck for more than 2 seconds
+                        # Implement recovery behavior
+                        LIN_VEL = 0.0
+                        # Alternate turn direction if we've been stuck multiple times
+                        if self.consecutive_stops > 3:
+                            self.recovery_turn_direction *= -1
+                            self.consecutive_stops = 0
+                        ANG_VEL = 1.0 * self.recovery_turn_direction
+                        print("STUCK: Implementing recovery behavior")
                 else:
-                    # Fallback to original LIDAR-based logic if path not detected
-                    if (front_center < FRONT_OBSTACLE_THRESHOLD or
-                        front_left < FRONT_OBSTACLE_THRESHOLD or
-                        front_right < FRONT_OBSTACLE_THRESHOLD):
-                        # Obstacle ahead, slow down and turn
+                    self.stuck_time = None
+                    
+                    if front_min < self.SAFE_DISTANCE:
+                        # Obstacle ahead - slow down and turn
+                        LIN_VEL = 0.05
+                        # Choose turn direction based on available space
                         if (front_left > front_right) == self.prefer_left_turns:
-                            LIN_VEL = 0.05
-                            ANG_VEL = 1.2
+                            ANG_VEL = 1.0
                             print("OBSTACLE AHEAD: Turning Left")
                         else:
-                            LIN_VEL = 0.05
-                            ANG_VEL = -1.2
+                            ANG_VEL = -1.0
                             print("OBSTACLE AHEAD: Turning Right")
-
-                    elif (left_side < SIDE_OBSTACLE_THRESHOLD or right_side < SIDE_OBSTACLE_THRESHOLD):
-                        # Obstacle on sides, slow slightly and turn away
-                        if left_side < SIDE_OBSTACLE_THRESHOLD:
-                            LIN_VEL = 0.1
+                    
+                    elif sides_min < self.SAFE_DISTANCE:
+                        # Obstacle on sides - adjust course
+                        LIN_VEL = 0.1
+                        if left_side < right_side:
                             ANG_VEL = -0.8
-                            print("SIDE OBSTACLE: Turning Right")
+                            print("SIDE OBSTACLE: Adjusting Right")
                         else:
-                            LIN_VEL = 0.1
                             ANG_VEL = 0.8
-                            print("SIDE OBSTACLE: Turning Left")
-
+                            print("SIDE OBSTACLE: Adjusting Left")
+                    
                     else:
-                        # Path is clear, go at maximum allowed speed and follow walls
-                        # Increased linear velocity from 0.2 to 0.22 to maximize forward speed
-                        LIN_VEL = 0.22
-                        ANG_VEL = self.pid_1_lat.control((left_side - right_side) * 2.0, tstamp)
-                        print("Wall Following - MAX SPEED")
+                        # Path is clear - normal operation
+                        if self.path_detected:
+                            # Use path center to influence turning decision
+                            image_width = 640  # Adjust based on your camera resolution
+                            path_error = (image_width/2 - self.path_center) / (image_width/2)
+                            
+                            if abs(path_error) > 0.2:
+                                LIN_VEL = 0.15
+                                ANG_VEL = self.pid_1_lat.control(path_error * 1.5, tstamp)
+                            else:
+                                LIN_VEL = 0.2
+                                ANG_VEL = self.pid_1_lat.control((left_side - right_side) * 1.5, tstamp)
+                        else:
+                            # Default to wall following if no path detected
+                            LIN_VEL = 0.2
+                            ANG_VEL = self.pid_1_lat.control((left_side - right_side) * 1.5, tstamp)
 
-                # Enforce velocity limits
-                self.ctrl_msg.linear.x = min(0.22, float(LIN_VEL))
-                # Keep angular velocity within safe limits
-                if ANG_VEL > 2.84:
-                    ANG_VEL = 2.84
-                elif ANG_VEL < -2.84:
-                    ANG_VEL = -2.84
-                self.ctrl_msg.angular.z = ANG_VEL
+                # Update last movement time if we're actually moving
+                if abs(LIN_VEL) > 0.05 or abs(ANG_VEL) > 0.1:
+                    self.last_movement_time = time.time()
+
+                # Enforce velocity limits with smoother transitions
+                target_linear_x = min(0.22, float(LIN_VEL))
+                current_linear_x = self.ctrl_msg.linear.x
+                # Smooth acceleration and deceleration
+                if target_linear_x > current_linear_x:
+                    self.ctrl_msg.linear.x = min(target_linear_x, current_linear_x + 0.05)
+                else:
+                    self.ctrl_msg.linear.x = max(target_linear_x, current_linear_x - 0.05)
+
+                # Keep angular velocity within safe limits with smoother transitions
+                target_angular_z = np.clip(ANG_VEL, -2.84, 2.84)
+                current_angular_z = self.ctrl_msg.angular.z
+                if target_angular_z > current_angular_z:
+                    self.ctrl_msg.angular.z = min(target_angular_z, current_angular_z + 0.2)
+                else:
+                    self.ctrl_msg.angular.z = max(target_angular_z, current_angular_z - 0.2)
 
                 # Publish the command
                 self.robot_ctrl_pub.publish(self.ctrl_msg)
