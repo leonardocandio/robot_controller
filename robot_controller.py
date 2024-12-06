@@ -97,7 +97,8 @@ class RobotController(Node):
         self.path_not_found_count = 0
         self.MAX_PATH_LOSS_COUNT = 10
         self.last_valid_direction = None
-
+        self.image_width = 640  # Default image width
+        
         # Camera subscription
         self.camera_sub = self.create_subscription(
             Image, 
@@ -130,6 +131,7 @@ class RobotController(Node):
             # Convert ROS Image message to OpenCV format
             cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
             height, width = cv_image.shape[:2]
+            self.image_width = width  # Store the actual image width
             
             # Convert to grayscale
             gray = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
@@ -166,7 +168,7 @@ class RobotController(Node):
                     self.path_center = cx
                     self.path_detected = True
                     self.path_not_found_count = 0
-                    self.last_path_error = (width/2 - cx) / (width/2)
+                    self.last_path_error = (self.image_width/2 - cx) / (self.image_width/2)
             else:
                 self.path_not_found_count += 1
                 if self.path_not_found_count > self.MAX_PATH_LOSS_COUNT:
@@ -265,7 +267,7 @@ class RobotController(Node):
                         # Calculate steering based on path error and direction
                         if self.last_valid_direction is not None:
                             # Combine path error with direction for smoother turns
-                            combined_error = 0.7 * path_error + 0.3 * (self.last_valid_direction / width)
+                            combined_error = 0.7 * path_error + 0.3 * (self.last_valid_direction / self.image_width)
                             ANG_VEL = self.pid_1_lat.control(combined_error * 1.5, time.time())
                         else:
                             ANG_VEL = self.pid_1_lat.control(path_error * 1.5, time.time())
@@ -277,7 +279,7 @@ class RobotController(Node):
                         # Lost path - use last known direction or start recovery
                         if self.last_valid_direction is not None:
                             LIN_VEL = 0.1
-                            ANG_VEL = 0.5 * (self.last_valid_direction / width)
+                            ANG_VEL = 0.5 * (self.last_valid_direction / self.image_width)
                         else:
                             LIN_VEL = 0.05
                             ANG_VEL = self.recovery_turn_direction * 0.8
