@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
 
-from asyncore import read
-import base64
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image, LaserScan
@@ -11,236 +9,186 @@ import cv2
 import numpy as np
 import logging
 import ollama
-import re
-from time import time
+import time
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 
-
-# Initialize logging to print to stdout
+# Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("RobotController")
-
-
 
 class RobotController(Node):
     def __init__(self, model_name, model_prompt):
         super().__init__('robot_controller')
         
-        # Existing initializations
+        # Initialize variables
         self.bridge = CvBridge()
         self.ollama_client = ollama.Client()
         self.model_name = model_name
         self.model_prompt = model_prompt
-        self.image_count = 0
-        self.last_command = Twist()
-        self.last_command.linear.x = 0.1
-        self.last_command.angular.z = 0.0
-        self.last_image_time = 0.0  # For rate limiting
-        self.process_interval = 0.5  # Process images every 0.5 seconds
-        self.lidar_data = None  # To store LiDAR data
+        self.last_image = None
+        self.is_turning = False
+        self.turn_direction = None
+        self.obstacle_detected = False
+        
+        # Constants
+        self.FRONT_OBSTACLE_THRESHOLD = 0.5  # meters
+        self.TURNING_SPEED = 0.5  # rad/s
+        self.FORWARD_SPEED = 0.2  # m/s
+        self.MIN_FRONT_ANGLE = -30  # degrees
+        self.MAX_FRONT_ANGLE = 30   # degrees
+        
+        # Create the model
         self.create_model()
-
-        # Camera subscription
+        
+        # Subscriptions
         self.camera_subscription = self.create_subscription(
             Image,
             '/image_raw',
             self.camera_callback,
             10)
 
-        # LiDAR subscription
         self.lidar_subscription = self.create_subscription(
             LaserScan,
             '/scan',
             self.lidar_callback,
             qos_profile=QoSProfile(
-            reliability=ReliabilityPolicy.BEST_EFFORT,  # Match the publisher's QoS
-            depth=10  # Adjust the queue size if needed
+                reliability=ReliabilityPolicy.BEST_EFFORT,
+                depth=10
             )
         )
 
-        # Control publisher
+        # Publisher
         self.control_publisher = self.create_publisher(
             Twist,
             'cmd_vel',
             10)
 
-        self.get_logger().info('Robot Controller Node initialized')
-        logger.info("Robot Controller Node initialized")
+        logger.info('Robot Controller Node initialized')
 
     def create_model(self):
         try:
             modelfile = f"""from {self.model_name}
             parameter temperature 0.5
-            system "{self.model_prompt}"
+            system "You are analyzing obstacles in a robot race track. Identify if the obstacle is another robot or a track wall/obstacle. If it's a wall, suggest which direction to turn (left or right) based on the track layout. Format response as: <type>robot/wall</type><direction>left/right</direction>"
             """
             self.ollama_client.create(model=self.model_name, modelfile=modelfile)
-            self.get_logger().info(f"Model '{self.model_name}' created successfully")
             logger.info(f"Model '{self.model_name}' created successfully")
         except Exception as e:
-            self.get_logger().error(f"Failed to create model: {str(e)}")
             logger.error(f"Failed to create model: {str(e)}")
 
-
-    def lidar_callback(self, msg):
-        """
-        Process LiDAR data from the LDS-02 sensor and extract six points of distance.
-        The points represent the minimum distance in six evenly divided angular sectors.
-        """
-        ranges = np.array(msg.ranges)  # Convert ranges to a numpy array for easier processing
-
-        # LDS-02 specific parameters - explicitly set these values
-        min_range = 0.12  # 12cm minimum range for LDS-02
-        max_range = 3.5   # 3.5m maximum range for LDS-02
-
-        # Clean up the ranges array
-        # Convert to float32 to match ROS2 data type
-        ranges = ranges.astype(np.float32)
-
-        # Create a mask for valid measurements
-        valid_mask = (ranges >= min_range) & (ranges <= max_range) & (~np.isnan(ranges)) & (~np.isinf(ranges))
-        ranges[~valid_mask] = max_range  # Set invalid measurements to max_range
-
-        # Define the angular resolution for six sectors (360° divided into 6 sectors = 60° each)
-        num_sectors = 6
-        sector_size = len(ranges) // num_sectors
-
-        # Extract minimum distances from each sector
-        distances = []
-        for i in range(num_sectors):
-            # Calculate start and end indices for each sector
-            start_idx = i * sector_size
-            end_idx = start_idx + sector_size
-
-            # Handle wrap-around for the last sector
-            if i == num_sectors - 1:
-                sector = ranges[start_idx:]
-            else:
-                sector = ranges[start_idx:end_idx]
-
-            # Find the minimum distance in the sector
-            min_distance = np.min(sector)
-
-            # Map distances: 0 if too close, min_distance otherwise
-            if min_distance <= 0.2:  # Threshold for "too close"
-                mapped_distance = 0.0
-            else:
-                mapped_distance = min_distance
-
-            distances.append(mapped_distance)
-
-        # Assign sectors with corrected front/rear/side mapping
-        self.lidar_data = {
-            "front": distances[5],        # Front sector
-            "front_right": distances[4],  # Front Right sector
-            "right": distances[3],        # Right sector
-            "rear": distances[2],         # Rear sector
-            "left": distances[1],         # Left sector
-            "front_left": distances[0]    # Front Left sector
-        }
-
-
     def camera_callback(self, msg):
-        current_time = time()
-        if current_time - self.last_image_time < self.process_interval:
-            return  # Skip processing if it's too soon
-        
-        self.last_image_time = current_time  # Update the last processed time
-        
+        """Store the latest image for obstacle analysis"""
         try:
-            cv_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+            self.last_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
         except Exception as e:
-            self.get_logger().error(f'Failed to convert image: {str(e)}')
             logger.error(f'Failed to convert image: {str(e)}')
-            return
 
-        control_msg = self.analyze_image(cv_image)
+    def get_front_distance(self, ranges):
+        """Get the minimum distance in the front sector"""
+        angles = np.arange(len(ranges))
+        front_indices = np.where(
+            (angles >= len(ranges) * (self.MIN_FRONT_ANGLE + 180) / 360) &
+            (angles <= len(ranges) * (self.MAX_FRONT_ANGLE + 180) / 360)
+        )[0]
         
-        if self.is_significant_change(control_msg):
-            self.control_publisher.publish(control_msg)
-            self.last_command = control_msg  # Update the last command
-            logger.info(f"Published control: linear={control_msg.linear}, angular={control_msg.angular}")
-        else:
-            self.control_publisher.publish(self.last_command)
-            logger.info(f"No significant change in control, publishing last linear={self.last_command.linear.x} angular={self.last_command.angular.z}")
+        front_ranges = np.array(ranges)[front_indices]
+        valid_ranges = front_ranges[(front_ranges > 0.12) & (front_ranges < 3.5)]
+        
+        return np.min(valid_ranges) if len(valid_ranges) > 0 else float('inf')
 
+    def analyze_obstacle(self):
+        """Use the model to analyze the obstacle type and get turning direction"""
+        if self.last_image is None:
+            logger.error("No image available for analysis")
+            return None, None
 
-    def is_significant_change(self, control_msg):
-        """Check if the control message has significant changes compared to the last command."""
-        linear_diff = abs(control_msg.linear.x - self.last_command.linear.x)
-        angular_diff = abs(control_msg.angular.z - self.last_command.angular.z)
-        return linear_diff > 0.05 or angular_diff > 0.05  # Tune thresholds as needed
-
-    def analyze_image(self, image):
         try:
-            _, buffer = cv2.imencode('.jpg', image)
+            # Convert image to bytes
+            _, buffer = cv2.imencode('.jpg', self.last_image)
             image_bytes = buffer.tobytes()
-        except Exception as e:
-            self.get_logger().error(f'Failed to encode image: {str(e)}')
-            return Twist()
 
-        # Log the LiDAR distances when analyzing image
-        logger.info(
-            f"LiDAR Distances - Front: {self.lidar_data['front']:.2f} m, "
-            f"Front Left: {self.lidar_data['front_left']:.2f} m, Left: {self.lidar_data['left']:.2f} m, "
-            f"Rear: {self.lidar_data['rear']:.2f} m, Right: {self.lidar_data['right']:.2f} m, "
-            f"Front Right: {self.lidar_data['front_right']:.2f} m"
-        )
-
-        # Combine LiDAR and image data in the model prompt
-        lidar_context = (
-            f"LiDAR readings: "
-            f"Front: {self.lidar_data['front']:.2f}m, "
-            f"Front-Left: {self.lidar_data['front_left']:.2f}m, "
-            f"Front-Right: {self.lidar_data['front_right']:.2f}m, "
-            f"Left: {self.lidar_data['left']:.2f}m, "
-            f"Right: {self.lidar_data['right']:.2f}m, "
-            f"Rear: {self.lidar_data['rear']:.2f}m. "
-        )
-        prompt = (
-            f"This is image {self.image_count}. {lidar_context} Analyze it to generate control commands."
-        )
-
-        try:
+            # Get model's analysis
             response = self.ollama_client.generate(
                 model=self.model_name,
-                prompt=prompt,
+                prompt="Is this obstacle another robot or a track wall? If wall, which direction should I turn?",
                 images=[image_bytes],
-                keep_alive="1h"
+                keep_alive=True
             )
+
+            # Parse response
+            import re
+            type_match = re.search(r'<type>(.*?)</type>', response.response)
+            direction_match = re.search(r'<direction>(.*?)</direction>', response.response)
+
+            obstacle_type = type_match.group(1) if type_match else None
+            turn_direction = direction_match.group(1) if direction_match else None
+
+            return obstacle_type, turn_direction
+
         except Exception as e:
-            self.get_logger().error(f'Failed to generate ollama response: {str(e)}')
-            logger.error(f'Failed to generate ollama response: {str(e)}')
-            return Twist()
+            logger.error(f"Error in obstacle analysis: {str(e)}")
+            return None, None
 
-        try:
-            control_msg = Twist()
-            response_data = self.translate_response(response)
-            control_msg.linear.x = response_data["linear"]
-            control_msg.angular.z = response_data["angular"]
-        except Exception as e:
-            self.get_logger().error(f'Failed to parse ollama response: {str(e)}')
-            logger.error(f'Failed to parse ollama response: {str(e)}')
-            control_msg = Twist()
+    def lidar_callback(self, msg):
+        """Process LiDAR data and control the robot"""
+        if self.is_turning:
+            # Continue turning until front is clear
+            front_distance = self.get_front_distance(msg.ranges)
+            if front_distance > self.FRONT_OBSTACLE_THRESHOLD:
+                self.is_turning = False
+                self.turn_direction = None
+                self.obstacle_detected = False
+            else:
+                # Continue turning in the same direction
+                self.execute_turn()
+            return
 
-        self.image_count += 1
-        return control_msg
+        # Check for obstacles in front
+        front_distance = self.get_front_distance(msg.ranges)
+        
+        if front_distance <= self.FRONT_OBSTACLE_THRESHOLD and not self.obstacle_detected:
+            # New obstacle detected
+            self.obstacle_detected = True
+            # Stop the robot
+            self.publish_stop()
+            
+            # Analyze obstacle
+            obstacle_type, turn_direction = self.analyze_obstacle()
+            
+            if obstacle_type == 'wall' and turn_direction in ['left', 'right']:
+                self.is_turning = True
+                self.turn_direction = turn_direction
+                logger.info(f"Wall detected, turning {turn_direction}")
+                self.execute_turn()
+            elif obstacle_type == 'robot':
+                logger.info("Robot detected, waiting...")
+                self.publish_stop()
+            else:
+                logger.warning("Unclear obstacle analysis, stopping")
+                self.publish_stop()
+        
+        elif front_distance > self.FRONT_OBSTACLE_THRESHOLD:
+            # Clear path ahead
+            self.move_forward()
 
-    def translate_response(self, response):
-        print("response: ", response.response)
-        linear_pattern = r"<linear>(.*?)</linear>"
-        angular_pattern = r"<angular>(.*?)</angular>"
+    def execute_turn(self):
+        """Execute the turning movement"""
+        cmd = Twist()
+        if self.turn_direction == 'left':
+            cmd.angular.z = self.TURNING_SPEED
+        else:  # right
+            cmd.angular.z = -self.TURNING_SPEED
+        self.control_publisher.publish(cmd)
 
-        linear_match = re.search(linear_pattern, response.response, re.DOTALL)
-        angular_match = re.search(angular_pattern, response.response, re.DOTALL)
+    def move_forward(self):
+        """Move the robot forward"""
+        cmd = Twist()
+        cmd.linear.x = self.FORWARD_SPEED
+        self.control_publisher.publish(cmd)
 
-        if linear_match and angular_match:
-            return {
-                "linear": float(linear_match.group(1).strip()),
-                #"angular": float(angular_match.group(1).strip()),
-                "angular" : 0.0,
-            }
-        return None
-
+    def publish_stop(self):
+        """Stop the robot"""
+        self.control_publisher.publish(Twist())
 
 def main():
     rclpy.init()
@@ -248,53 +196,26 @@ def main():
     model_name = "llava:7b"
     model_prompt = (
         """
-    You are a TurtleBot3 ROS2-powered robot navigating a racetrack. The track is defined by carboard boxes, multiple obstacles and a glass wall. Your objective is to navigate the racetrack and win the race. There will be other robots in the race, try to avoid them.
-
-    Your task is to generate ROS2 Twist control commands based on the following input:
-    - LiDAR data: obstacle distances in meters for front, front left, front right, left, and right directions.
-    - Camera image: a real-time view of the environment.
-
-    Format your response strictly as:
-    - Provide a short one sentence reasoning explanation behind your commands enclosed in <reasoning> tags.
-    - Provide the forward velocity in m/s (linear.x) value enclosed in <linear> tags.
-    - Provide the angular velocity in rad/s (angular.z) value enclosed in <angular> tags.
-
-    Important: You should always respond with a command even if the robot is not inside the specified location
-
-    Explanation of <linear> and <angular>
-    1: Moving a Robot Forward
-    If you want to move a robot forward with a linear velocity of 1 meter per second and no angular velocity, you would use the following command
-    <linear>1.0</linear>
-    <angular>0.0</angular>
-
-
-    2: Rotating the Robot
-    To rotate a robot around its z-axis (turning in place), you would set the angular velocity and leave the linear velocitiy at zero:
-    <linear>0.0</linear>
-    <angular>1.0</angular>
-
-    3: Moving and Rotating Simultaneously
-    If you want the robot to move forward while rotating, you can set both the linear and angular velocities. For example, the robot might move forward at 0.5 m/s while rotating at 0.2 rad/s:
-    <linear>0.5</linear>
-    <angular>0.2</angular>
-
-
-    DO NOT include any text outside of these tags. Do not provide explanations, comments, or additional information.
-    DO NOT nest tags
-    """
+        You are analyzing obstacles in a robot race track.
+        Identify if the obstacle is another robot or a track wall/obstacle.
+        If it's a wall, suggest which direction to turn (left or right) based on the track layout.
+        Format response as: <type>robot/wall</type><direction>left/right</direction>
+        """
     )
 
     controller = RobotController(model_name, model_prompt)
-
+    
     try:
         rclpy.spin(controller)
     except KeyboardInterrupt:
-        pass
+        logger.info("KeyboardInterrupt detected, stopping robot...")
+        stop_cmd = Twist()
+        controller.control_publisher.publish(stop_cmd)
+        time.sleep(0.5)
     finally:
         controller.destroy_node()
         rclpy.shutdown()
         logger.info("Shutting down Robot Controller Node")
-
 
 if __name__ == '__main__':
     main()
