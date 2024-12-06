@@ -75,6 +75,7 @@ class RobotController(Node):
         self.laserscan = None
         self.start_mode = "outside"
         self.start_time = self.get_clock().now()
+        self.initialization_complete = False
         self.ctrl_msg = Twist()
         self.prefer_left_turns = True
         
@@ -205,104 +206,111 @@ class RobotController(Node):
         return robot_detections
 
     def robot_controller_callback(self):
-        DELAY = 4.0  # Time delay (s)
-        if self.get_clock().now() - self.start_time > Duration(seconds=DELAY):
+        current_time = self.get_clock().now()
+        
+        # Check if we've received LIDAR data
+        if not self.initialization_complete:
             if self.lidar_available and self.laserscan is not None:
-                # Initialize velocity variables with safe defaults
-                LIN_VEL = 0.0
-                ANG_VEL = 0.0
-                
-                scan_length = len(self.laserscan)
-                step_size = 360.0 / scan_length
+                print("Initialization complete, starting robot control")
+                self.initialization_complete = True
+            else:
+                print("Waiting for sensor data...")
+                return
 
-                # Enhanced sector calculations
-                front_sector = max(1, int(45 / step_size))
-                side_sector = max(1, int(60 / step_size))
+        if self.lidar_available and self.laserscan is not None:
+            # Initialize velocity variables with safe defaults
+            LIN_VEL = 0.0
+            ANG_VEL = 0.0
+            
+            scan_length = len(self.laserscan)
+            step_size = 360.0 / scan_length
 
-                # Detect other robots
-                robot_detections = self.detect_robots(self.laserscan, scan_length)
-                
-                # Calculate minimum distances
-                front_min = min(
-                    float(np.min(self.laserscan[:front_sector])),
-                    float(np.min(self.laserscan[-front_sector:]))
-                )
-                sides_min = float(np.min(self.laserscan[int(scan_length/4):int(3*scan_length/4)]))
-                
-                # Check for nearby robots
-                robots_nearby = len(robot_detections) > 0
-                
-                # Critical situation check
-                in_critical_situation = (
-                    front_min < self.CRITICAL_DISTANCE or 
-                    sides_min < self.CRITICAL_DISTANCE/2 or
-                    (robots_nearby and front_min < self.ROBOT_DETECTION_DISTANCE)
-                )
+            # Enhanced sector calculations
+            front_sector = max(1, int(45 / step_size))
+            side_sector = max(1, int(60 / step_size))
 
-                if in_critical_situation:
-                    if self.stuck_time is None:
-                        self.stuck_time = time.time()
-                        self.consecutive_stops += 1
-                    elif time.time() - self.stuck_time > 2.0:
-                        LIN_VEL = 0.0
-                        if self.consecutive_stops > 3:
-                            self.recovery_turn_direction *= -1
-                            self.consecutive_stops = 0
-                        ANG_VEL = 1.0 * self.recovery_turn_direction
-                else:
-                    self.stuck_time = None
+            # Detect other robots
+            robot_detections = self.detect_robots(self.laserscan, scan_length)
+            
+            # Calculate minimum distances
+            front_min = min(
+                float(np.min(self.laserscan[:front_sector])),
+                float(np.min(self.laserscan[-front_sector:]))
+            )
+            sides_min = float(np.min(self.laserscan[int(scan_length/4):int(3*scan_length/4)]))
+            
+            # Check for nearby robots
+            robots_nearby = len(robot_detections) > 0
+            
+            # Critical situation check
+            in_critical_situation = (
+                front_min < self.CRITICAL_DISTANCE or 
+                sides_min < self.CRITICAL_DISTANCE/2 or
+                (robots_nearby and front_min < self.ROBOT_DETECTION_DISTANCE)
+            )
+
+            if in_critical_situation:
+                if self.stuck_time is None:
+                    self.stuck_time = time.time()
+                    self.consecutive_stops += 1
+                elif time.time() - self.stuck_time > 2.0:
+                    LIN_VEL = 0.0
+                    if self.consecutive_stops > 3:
+                        self.recovery_turn_direction *= -1
+                        self.consecutive_stops = 0
+                    ANG_VEL = 1.0 * self.recovery_turn_direction
+            else:
+                self.stuck_time = None
+                
+                if self.path_detected:
+                    # Use path center and direction for navigation
+                    path_error = self.last_path_error
                     
-                    if self.path_detected:
-                        # Use path center and direction for navigation
-                        path_error = self.last_path_error
-                        
-                        # Adjust speed based on path error and obstacles
-                        if abs(path_error) > 0.3:
-                            LIN_VEL = 0.12  # Slower on sharp turns
-                        elif front_min < self.SAFE_DISTANCE * 1.5:
-                            LIN_VEL = 0.15  # Slower near obstacles
-                        else:
-                            LIN_VEL = 0.2   # Normal speed
-                        
-                        # Calculate steering based on path error and direction
-                        if self.last_valid_direction is not None:
-                            # Combine path error with direction for smoother turns
-                            combined_error = 0.7 * path_error + 0.3 * (self.last_valid_direction / self.image_width)
-                            ANG_VEL = self.pid_1_lat.control(combined_error * 1.5, time.time())
-                        else:
-                            ANG_VEL = self.pid_1_lat.control(path_error * 1.5, time.time())
-                            
-                        # Reduce speed if other robots are nearby
-                        if robots_nearby:
-                            LIN_VEL *= 0.7
+                    # Adjust speed based on path error and obstacles
+                    if abs(path_error) > 0.3:
+                        LIN_VEL = 0.12  # Slower on sharp turns
+                    elif front_min < self.SAFE_DISTANCE * 1.5:
+                        LIN_VEL = 0.15  # Slower near obstacles
                     else:
-                        # Lost path - use last known direction or start recovery
-                        if self.last_valid_direction is not None:
-                            LIN_VEL = 0.1
-                            ANG_VEL = 0.5 * (self.last_valid_direction / self.image_width)
-                        else:
-                            LIN_VEL = 0.05
-                            ANG_VEL = self.recovery_turn_direction * 0.8
-
-                # Smooth velocity transitions
-                target_linear_x = min(0.22, float(LIN_VEL))
-                current_linear_x = self.ctrl_msg.linear.x
-                if target_linear_x > current_linear_x:
-                    self.ctrl_msg.linear.x = min(target_linear_x, current_linear_x + 0.05)
+                        LIN_VEL = 0.2   # Normal speed
+                    
+                    # Calculate steering based on path error and direction
+                    if self.last_valid_direction is not None:
+                        # Combine path error with direction for smoother turns
+                        combined_error = 0.7 * path_error + 0.3 * (self.last_valid_direction / self.image_width)
+                        ANG_VEL = self.pid_1_lat.control(combined_error * 1.5, time.time())
+                    else:
+                        ANG_VEL = self.pid_1_lat.control(path_error * 1.5, time.time())
+                        
+                    # Reduce speed if other robots are nearby
+                    if robots_nearby:
+                        LIN_VEL *= 0.7
                 else:
-                    self.ctrl_msg.linear.x = max(target_linear_x, current_linear_x - 0.05)
+                    # Lost path - use last known direction or start recovery
+                    if self.last_valid_direction is not None:
+                        LIN_VEL = 0.1
+                        ANG_VEL = 0.5 * (self.last_valid_direction / self.image_width)
+                    else:
+                        LIN_VEL = 0.05
+                        ANG_VEL = self.recovery_turn_direction * 0.8
 
-                target_angular_z = np.clip(ANG_VEL, -2.84, 2.84)
-                current_angular_z = self.ctrl_msg.angular.z
-                if target_angular_z > current_angular_z:
-                    self.ctrl_msg.angular.z = min(target_angular_z, current_angular_z + 0.2)
-                else:
-                    self.ctrl_msg.angular.z = max(target_angular_z, current_angular_z - 0.2)
+            # Smooth velocity transitions
+            target_linear_x = min(0.22, float(LIN_VEL))
+            current_linear_x = self.ctrl_msg.linear.x
+            if target_linear_x > current_linear_x:
+                self.ctrl_msg.linear.x = min(target_linear_x, current_linear_x + 0.05)
+            else:
+                self.ctrl_msg.linear.x = max(target_linear_x, current_linear_x - 0.05)
 
-                # Publish the command
-                self.robot_ctrl_pub.publish(self.ctrl_msg)
-        else:
-            print("Initializing...")
+            target_angular_z = np.clip(ANG_VEL, -2.84, 2.84)
+            current_angular_z = self.ctrl_msg.angular.z
+            if target_angular_z > current_angular_z:
+                self.ctrl_msg.angular.z = min(target_angular_z, current_angular_z + 0.2)
+            else:
+                self.ctrl_msg.angular.z = max(target_angular_z, current_angular_z - 0.2)
+
+            # Publish the command
+            self.robot_ctrl_pub.publish(self.ctrl_msg)
 
 
 def main(args=None):
