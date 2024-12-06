@@ -190,6 +190,10 @@ class RobotController(Node):
                 # Timestamp for PID
                 tstamp = time.time()
 
+                # Initialize ANG_VEL at the start
+                ANG_VEL = 0.0
+                LIN_VEL = 0.0
+
                 # Racing-specific parameters
                 FRONT_OBSTACLE_THRESHOLD = 0.8  # Increased for larger robot
                 SIDE_OBSTACLE_THRESHOLD = 0.6  # Increased for larger robot
