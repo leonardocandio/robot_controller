@@ -102,6 +102,18 @@ class RobotController(Node):
         self.pid_1_lat = PIDController(0.3, 0.01, 0.12, 10)  # Reduced gains for smoother turns
         self.pid_1_lon = PIDController(0.15, 0.002, 0.008, 10)
 
+        # Adjust thresholds for larger robot
+        self.ROBOT_WIDTH = 0.5  # meters
+        self.MIN_SAFE_DISTANCE = 0.4  # minimum safe distance from walls
+        
+        # Reduced PID values for gentler control
+        self.pid_1_lat = PIDController(0.2, 0.005, 0.08, 10)  # Even smoother turns
+        self.pid_1_lon = PIDController(0.15, 0.002, 0.008, 10)
+
+        # Add direction tracking
+        self.wrong_direction_count = 0
+        self.last_five_angles = []  # Track recent angular velocities
+
     def robot_lidar_callback(self, msg):
         # Robust LIDAR data preprocessing
         ranges = np.array(msg.ranges)
@@ -182,54 +194,78 @@ class RobotController(Node):
                 tstamp = time.time()
 
                 # Racing-specific parameters
-                FRONT_OBSTACLE_THRESHOLD = 0.65  # Slightly more conservative
-                SIDE_OBSTACLE_THRESHOLD = 0.4
-                BASE_SPEED = 0.25  # Keep the same speed
+                FRONT_OBSTACLE_THRESHOLD = 0.8  # Increased for larger robot
+                SIDE_OBSTACLE_THRESHOLD = 0.6  # Increased for larger robot
+                BASE_SPEED = 0.22  # Slightly reduced base speed
+                MAX_ANGULAR_VEL = 0.8  # Reduced maximum turning speed
                 
                 # Combine LIDAR and camera data for better wall following
                 left_wall_estimate = min(left_side, self.wall_distance_left)
                 right_wall_estimate = min(right_side, self.wall_distance_right)
 
-                # Racing logic for box corridor
-                if (
-                    front_center < FRONT_OBSTACLE_THRESHOLD
-                    or front_left < FRONT_OBSTACLE_THRESHOLD
-                    or front_right < FRONT_OBSTACLE_THRESHOLD
-                ):
-                    # Smoother turns when approaching wall
-                    if (front_left > front_right) == self.prefer_left_turns:
-                        LIN_VEL = 0.1  # Slightly higher forward velocity in turns
-                        ANG_VEL = 1.0  # Reduced angular velocity for smoother turns
-                        print("RACING: Smooth left turn")
-                    else:
-                        LIN_VEL = 0.1
-                        ANG_VEL = -1.0
-                        print("RACING: Smooth right turn")
-
+                # Direction monitoring
+                if len(self.last_five_angles) >= 5:
+                    self.last_five_angles.pop(0)
+                self.last_five_angles.append(ANG_VEL)
+                
+                # Detect if robot might be turning around
+                avg_angular_vel = sum(self.last_five_angles) / len(self.last_five_angles)
+                if abs(avg_angular_vel) > 0.5:
+                    self.wrong_direction_count += 1
                 else:
-                    # Balanced wall following with combined sensor data
-                    LIN_VEL = BASE_SPEED
-                    # Reduced wall following sensitivity
-                    wall_diff = (left_wall_estimate - right_wall_estimate) * 1.5  # Reduced multiplier
-                    ANG_VEL = self.pid_1_lat.control(
-                        wall_diff,
-                        time.time(),
-                    )
-                    
-                    # Adjust speed based on corridor width
-                    corridor_width = left_wall_estimate + right_wall_estimate
-                    if corridor_width > 1.5:  # Wider section
-                        LIN_VEL *= 1.2
-                    
-                    print("RACING: Wall following")
+                    self.wrong_direction_count = max(0, self.wrong_direction_count - 1)
 
-                # Apply velocity limits appropriate for box corridor
-                self.ctrl_msg.linear.x = min(0.3, float(LIN_VEL))
-                self.ctrl_msg.angular.z = min(2.84, float(ANG_VEL))
+                # Prevent turn-around behavior
+                if self.wrong_direction_count > 10:
+                    LIN_VEL = 0.05
+                    ANG_VEL = 0.0
+                    self.get_logger().warn("⚠️ Preventing turn-around, straightening path")
+                    self.wrong_direction_count = 0
+                else:
+                    # Racing logic for box corridor
+                    if (
+                        front_center < FRONT_OBSTACLE_THRESHOLD
+                        or front_left < FRONT_OBSTACLE_THRESHOLD
+                        or front_right < FRONT_OBSTACLE_THRESHOLD
+                    ):
+                        # Even smoother turns when approaching wall
+                        if (front_left > front_right) == self.prefer_left_turns:
+                            LIN_VEL = 0.12
+                            ANG_VEL = MAX_ANGULAR_VEL
+                            self.get_logger().info("🔄 Smooth left turn - FL: %.2f, FR: %.2f", front_left, front_right)
+                        else:
+                            LIN_VEL = 0.12
+                            ANG_VEL = -MAX_ANGULAR_VEL
+                            self.get_logger().info("🔄 Smooth right turn - FL: %.2f, FR: %.2f", front_left, front_right)
+
+                    else:
+                        # Wall following with safety margins
+                        LIN_VEL = BASE_SPEED
+                        wall_diff = (left_wall_estimate - right_wall_estimate) * 1.2  # Further reduced multiplier
+                        ANG_VEL = self.pid_1_lat.control(wall_diff, time.time())
+                        
+                        # Limit angular velocity
+                        ANG_VEL = np.clip(ANG_VEL, -MAX_ANGULAR_VEL, MAX_ANGULAR_VEL)
+                        
+                        # Comprehensive logging
+                        self.get_logger().info(
+                            "🏃 Racing Status:\n"
+                            "  Speed: %.2f m/s\n"
+                            "  Turn Rate: %.2f rad/s\n"
+                            "  Distances - Left: %.2f, Right: %.2f, Front: %.2f\n"
+                            "  Wall Difference: %.2f",
+                            LIN_VEL, ANG_VEL, left_wall_estimate, 
+                            right_wall_estimate, front_center, wall_diff
+                        )
+
+                # More conservative velocity limits for larger robot
+                self.ctrl_msg.linear.x = min(0.25, float(LIN_VEL))  # Reduced max speed
+                self.ctrl_msg.angular.z = min(MAX_ANGULAR_VEL, float(ANG_VEL))
 
                 self.robot_ctrl_pub.publish(self.ctrl_msg)
         else:
-            print("Initializing...")
+            self.get_logger().info("⏳ Initializing... %.1f seconds remaining", 
+                                 DELAY - (self.get_clock().now() - self.start_time).nanoseconds/1e9)
 
 
 def main(args=None):
