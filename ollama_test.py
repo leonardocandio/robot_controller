@@ -23,15 +23,20 @@ logging.basicConfig(
 logger = logging.getLogger("ModelEvaluator")
 
 class ModelEvaluator:
-    def __init__(self, model_name, images_dir):
+    def __init__(self, model_name, images_dir, model_prompt):
         self.model_name = model_name
         self.images_dir = Path(images_dir)
         self.ollama_client = ollama.Client()
+        self.model_prompt = model_prompt
         self.metrics = {
             'response_times': [],
             'parsing_success_rate': 0,
             'responses': []
         }
+        self.modelfile= f"""from {self.model_name}
+            parameter temperature 0.5
+            system "{self.model_prompt}"
+            """
         
         # Mock LiDAR data for testing
         self.mock_lidar_scenarios = [
@@ -50,29 +55,9 @@ class ModelEvaluator:
         ]
 
     def create_model(self):
-        """Create or update the model with specific parameters"""
-        modelfile = f"""from {self.model_name}
-        parameter temperature 0.5
-        system \"\"\"
-        You are a TurtleBot3 ROS2-powered robot navigating a racetrack. The track is defined by carboard boxes, 
-        multiple obstacles and a glass wall. Your objective is to navigate the racetrack and win the race. 
-        There will be other robots in the race, try to avoid them.
-
-        Your task is to generate ROS2 Twist control commands based on the following input:
-        - LiDAR data: obstacle distances in meters for front, left, and right directions.
-        - Camera image: a real-time view of the environment.
-
-        Format your response strictly as:
-        - Provide a short one sentence reasoning explanation behind your commands enclosed in <reasoning> tags.
-        - Provide a short one sentence description of the image enclosed in <description> tags.
-        - Provide the forward velocity in m/s (linear.x) value enclosed in <linear> tags.
-        - Provide the angular velocity in rad/s (angular.z) value enclosed in <angular> tags.
-
-        DO NOT include any text outside of these tags.
-        \"\"\"
-        """
+        
         try:
-            self.ollama_client.create(model=self.model_name, modelfile=modelfile)
+            self.ollama_client.create(model=self.model_name, modelfile=self.modelfile)
             logger.info(f"Model '{self.model_name}' created successfully")
         except Exception as e:
             logger.error(f"Failed to create model: {str(e)}")
@@ -83,19 +68,16 @@ class ModelEvaluator:
         linear_pattern = r"<linear>(.*?)</linear>"
         angular_pattern = r"<angular>(.*?)</angular>"
         reasoning_pattern = r"<reasoning>(.*?)</reasoning>"
-        description_pattern = r"<description>(.*?)</description>"
 
         try:
             linear_match = re.search(linear_pattern, response, re.DOTALL)
             angular_match = re.search(angular_pattern, response, re.DOTALL)
             reasoning_match = re.search(reasoning_pattern, response, re.DOTALL)
-            description_match = re.search(description_pattern, response, re.DOTALL)
 
             return {
                 "linear": float(linear_match.group(1).strip()) if linear_match else None,
                 "angular": float(angular_match.group(1).strip()) if angular_match else None,
                 "reasoning": reasoning_match.group(1).strip() if reasoning_match else None,
-                "description": description_match.group(1).strip() if description_match else None
             }
         except Exception as e:
             logger.error(f"Failed to parse response: {str(e)}")
@@ -127,7 +109,7 @@ class ModelEvaluator:
                 model=self.model_name,
                 prompt=prompt,
                 images=[image_bytes],
-                keep_alive=True
+                keep_alive="1h"
             )
             response_time = time.time() - start_time
 
@@ -146,12 +128,12 @@ class ModelEvaluator:
             logger.error(f"Error evaluating image {image_path}: {str(e)}")
             return None
 
-    def run_evaluation(self, num_iterations=5):
+    def run_evaluation(self, num_iterations=1):
         """Run evaluation on all images in the directory"""
         logger.info(f"Starting evaluation with {num_iterations} iterations per image")
         
         results = []
-        image_files = list(self.images_dir.glob('*.jpg')) + list(self.images_dir.glob('*.png'))
+        image_files = list(self.images_dir.glob('*.jpeg')) + list(self.images_dir.glob('*.png'))
         
         for image_path in image_files:
             logger.info(f"Evaluating image: {image_path.name}")
@@ -215,18 +197,60 @@ class ModelEvaluator:
 
 def main():
     # Configuration
-    model_name = "llava:7b"
-    images_dir = "test_images"  # Directory containing test images
+    model_name = "minicpm-v"
+    images_dir = "photos"  # Directory containing test images
+    model_prompt = (
+        """
+    You are a TurtleBot3 ROS2-powered robot navigating a racetrack. The track is defined by carboard boxes, multiple obstacles and a glass wall. Your objective is to navigate the racetrack and win the race. There will be other robots in the race, try to avoid them.
+
+    Your task is to generate ROS2 Twist control commands based on the following input:
+    - LiDAR data: obstacle distances in meters for front, front left, front right, left, and right directions.
+    - Camera image: a real-time view of the environment.
+
+    Format your response strictly as:
+    - Provide a short one sentence reasoning explanation behind your commands enclosed in <reasoning> tags.
+    - Provide the forward velocity in m/s (linear.x) value enclosed in <linear> tags.
+    - Provide the angular velocity in rad/s (angular.z) value enclosed in <angular> tags.
+
+    Important: You should always respond with a command even if the robot is not inside the specified location
+
+    Explanation of <linear> and <angular>
+    1: Moving a Robot Forward
+    If you want to move a robot forward with a linear velocity of 1 meter per second and no angular velocity, you would use the following command
+    <linear>1.0</linear>
+    <angular>0.0</angular>
+
+
+    2: Rotating the Robot
+    To rotate a robot around its z-axis (turning in place), you would set the angular velocity and leave the linear velocitiy at zero:
+    <linear>0.0</linear>
+    <angular>1.0</angular>
+
+    3: Moving and Rotating Simultaneously
+    If you want the robot to move forward while rotating, you can set both the linear and angular velocities. For example, the robot might move forward at 0.5 m/s while rotating at 0.2 rad/s:
+    <linear>0.5</linear>
+    <angular>0.2</angular>
+
+    Example response:
+    <reasoning>To follow the sharp right turn, the robot should turn right</reasoning>
+    <linear>0.4</linear><angular>0.5</angular>
+
+
+
+    DO NOT include any text outside of these tags. Do not provide explanations, comments, or additional information.
+    DO NOT nest tags
+    """
+    )
     
     # Create evaluator
-    evaluator = ModelEvaluator(model_name, images_dir)
+    evaluator = ModelEvaluator(model_name, images_dir, model_prompt)
     
     try:
         # Create/update model
         evaluator.create_model()
         
         # Run evaluation
-        evaluator.run_evaluation(num_iterations=5)
+        evaluator.run_evaluation(num_iterations=1)
         
     except Exception as e:
         logger.error(f"Evaluation failed: {str(e)}")

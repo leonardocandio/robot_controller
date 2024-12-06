@@ -153,16 +153,15 @@ class RobotController(Node):
             logger.error(f'Failed to convert image: {str(e)}')
             return
 
-        # control_msg = self.analyze_image(cv_image)
+        control_msg = self.analyze_image(cv_image)
         
-        # if self.is_significant_change(control_msg):
-        #     self.control_publisher.publish(control_msg)
-        #     self.last_command = control_msg  # Update the last command
-        #     logger.info(f"Published control: linear={control_msg.linear}, angular={control_msg.angular}")
-        # else:
-        #     self.control_publisher.publish(self.last_command)
-        #     logger.info(f"No significant change in control, publishing last linear={self.last_command.linear.x} angular={self.last_command.angular.z}")
-        self.control_publisher.publish(Twist())
+        if self.is_significant_change(control_msg):
+            self.control_publisher.publish(control_msg)
+            self.last_command = control_msg  # Update the last command
+            logger.info(f"Published control: linear={control_msg.linear}, angular={control_msg.angular}")
+        else:
+            self.control_publisher.publish(self.last_command)
+            logger.info(f"No significant change in control, publishing last linear={self.last_command.linear.x} angular={self.last_command.angular.z}")
 
 
     def is_significant_change(self, control_msg):
@@ -206,7 +205,7 @@ class RobotController(Node):
                 model=self.model_name,
                 prompt=prompt,
                 images=[image_bytes],
-                keep_alive=True
+                keep_alive="1h"
             )
         except Exception as e:
             self.get_logger().error(f'Failed to generate ollama response: {str(e)}')
@@ -237,7 +236,8 @@ class RobotController(Node):
         if linear_match and angular_match:
             return {
                 "linear": float(linear_match.group(1).strip()),
-                "angular": float(angular_match.group(1).strip()),
+                #"angular": float(angular_match.group(1).strip()),
+                "angular" : 0.0,
             }
         return None
 
@@ -251,24 +251,36 @@ def main():
     You are a TurtleBot3 ROS2-powered robot navigating a racetrack. The track is defined by carboard boxes, multiple obstacles and a glass wall. Your objective is to navigate the racetrack and win the race. There will be other robots in the race, try to avoid them.
 
     Your task is to generate ROS2 Twist control commands based on the following input:
-    - LiDAR data: obstacle distances in meters for front, left, and right directions.
+    - LiDAR data: obstacle distances in meters for front, front left, front right, left, and right directions.
     - Camera image: a real-time view of the environment.
 
     Format your response strictly as:
     - Provide a short one sentence reasoning explanation behind your commands enclosed in <reasoning> tags.
-    - Provide a short one sentence description of the image enclosed in <description> tags.
     - Provide the forward velocity in m/s (linear.x) value enclosed in <linear> tags.
     - Provide the angular velocity in rad/s (angular.z) value enclosed in <angular> tags.
 
     Important: You should always respond with a command even if the robot is not inside the specified location
 
-    <example>
-    <description>A carboard box racing track with a sharp right turn</description>
-    <reasonin>To follow the sharp right turn, the robot should turn right</reasoning>
-    <linear>0.4</linear><angular>0.5</angular>
-    </example>
+    Explanation of <linear> and <angular>
+    1: Moving a Robot Forward
+    If you want to move a robot forward with a linear velocity of 1 meter per second and no angular velocity, you would use the following command
+    <linear>1.0</linear>
+    <angular>0.0</angular>
+
+
+    2: Rotating the Robot
+    To rotate a robot around its z-axis (turning in place), you would set the angular velocity and leave the linear velocitiy at zero:
+    <linear>0.0</linear>
+    <angular>1.0</angular>
+
+    3: Moving and Rotating Simultaneously
+    If you want the robot to move forward while rotating, you can set both the linear and angular velocities. For example, the robot might move forward at 0.5 m/s while rotating at 0.2 rad/s:
+    <linear>0.5</linear>
+    <angular>0.2</angular>
+
 
     DO NOT include any text outside of these tags. Do not provide explanations, comments, or additional information.
+    DO NOT nest tags
     """
     )
 
