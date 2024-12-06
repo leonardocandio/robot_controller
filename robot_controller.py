@@ -71,8 +71,8 @@ class RobotController(Node):
         self.timer = self.create_timer(timer_period, self.robot_controller_callback)
 
         # PID Controllers
-        self.pid_1_lat = PIDController(0.3, 0.01, 0.1, 10)
-        self.pid_1_lon = PIDController(0.1, 0.001, 0.005, 10)
+        self.pid_1_lat = PIDController(0.3, 0.01, 0.12, 10)
+        self.pid_1_lon = PIDController(0.15, 0.002, 0.008, 10)
 
         # State variables
         self.lidar_available = False
@@ -98,8 +98,8 @@ class RobotController(Node):
         self.wall_distance_left = float('inf')
         self.wall_distance_right = float('inf')
         
-        # More aggressive PID for racing
-        self.pid_1_lat = PIDController(0.4, 0.015, 0.15, 10)
+        # More aggressive PID for racing but smoother turning
+        self.pid_1_lat = PIDController(0.3, 0.01, 0.12, 10)  # Reduced gains for smoother turns
         self.pid_1_lon = PIDController(0.15, 0.002, 0.008, 10)
 
     def robot_lidar_callback(self, msg):
@@ -182,9 +182,9 @@ class RobotController(Node):
                 tstamp = time.time()
 
                 # Racing-specific parameters
-                FRONT_OBSTACLE_THRESHOLD = 0.6  # More aggressive
+                FRONT_OBSTACLE_THRESHOLD = 0.65  # Slightly more conservative
                 SIDE_OBSTACLE_THRESHOLD = 0.4
-                BASE_SPEED = 0.25  # Balanced speed for box corridor
+                BASE_SPEED = 0.25  # Keep the same speed
                 
                 # Combine LIDAR and camera data for better wall following
                 left_wall_estimate = min(left_side, self.wall_distance_left)
@@ -196,21 +196,21 @@ class RobotController(Node):
                     or front_left < FRONT_OBSTACLE_THRESHOLD
                     or front_right < FRONT_OBSTACLE_THRESHOLD
                 ):
-                    # Sharp turn when approaching wall
+                    # Smoother turns when approaching wall
                     if (front_left > front_right) == self.prefer_left_turns:
-                        LIN_VEL = 0.08
-                        ANG_VEL = 1.5
-                        print("RACING: Sharp left turn")
+                        LIN_VEL = 0.1  # Slightly higher forward velocity in turns
+                        ANG_VEL = 1.0  # Reduced angular velocity for smoother turns
+                        print("RACING: Smooth left turn")
                     else:
-                        LIN_VEL = 0.08
-                        ANG_VEL = -1.5
-                        print("RACING: Sharp right turn")
+                        LIN_VEL = 0.1
+                        ANG_VEL = -1.0
+                        print("RACING: Smooth right turn")
 
                 else:
                     # Balanced wall following with combined sensor data
                     LIN_VEL = BASE_SPEED
-                    # Use PID for smooth wall following
-                    wall_diff = (left_wall_estimate - right_wall_estimate) * 2.0
+                    # Reduced wall following sensitivity
+                    wall_diff = (left_wall_estimate - right_wall_estimate) * 1.5  # Reduced multiplier
                     ANG_VEL = self.pid_1_lat.control(
                         wall_diff,
                         time.time(),
