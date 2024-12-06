@@ -63,6 +63,15 @@ class RobotController(Node):
             'cmd_vel',
             10)
 
+        # Add timing variables for periodic logging
+        self.last_log_time = time.time()
+        self.LOG_INTERVAL = 1.0  # Log every 1 second
+        
+        # Add variables to store latest readings
+        self.latest_lidar_readings = None
+        self.latest_model_response = None
+        self.latest_front_distance = None
+
         logger.info('Robot Controller Node initialized')
 
     def create_model(self):
@@ -96,6 +105,25 @@ class RobotController(Node):
         
         return np.min(valid_ranges) if len(valid_ranges) > 0 else float('inf')
 
+    def log_status(self):
+        """Log robot status if enough time has passed"""
+        current_time = time.time()
+        if current_time - self.last_log_time >= self.LOG_INTERVAL:
+            self.last_log_time = current_time
+            
+            # Log LiDAR readings
+            if self.latest_lidar_readings is not None:
+                logger.info(
+                    f"LiDAR Status - "
+                    f"Front: {self.latest_front_distance:.2f}m, "
+                    f"State: {'Turning' if self.is_turning else 'Forward'}, "
+                    f"Direction: {self.turn_direction if self.turn_direction else 'None'}"
+                )
+            
+            # Log latest model response if available
+            if self.latest_model_response:
+                logger.info(f"Last Model Analysis - {self.latest_model_response}")
+
     def analyze_obstacle(self):
         """Use the model to analyze the obstacle type and get turning direction"""
         if self.last_image is None:
@@ -123,6 +151,9 @@ class RobotController(Node):
             obstacle_type = type_match.group(1) if type_match else None
             turn_direction = direction_match.group(1) if direction_match else None
 
+            # Store the latest model response
+            self.latest_model_response = f"Type: {obstacle_type}, Direction: {turn_direction}"
+
             return obstacle_type, turn_direction
 
         except Exception as e:
@@ -131,10 +162,16 @@ class RobotController(Node):
 
     def lidar_callback(self, msg):
         """Process LiDAR data and control the robot"""
+        # Store latest LiDAR readings
+        self.latest_lidar_readings = msg.ranges
+        self.latest_front_distance = self.get_front_distance(msg.ranges)
+
+        # Log status periodically
+        self.log_status()
+
         if self.is_turning:
             # Continue turning until front is clear
-            front_distance = self.get_front_distance(msg.ranges)
-            if front_distance > self.FRONT_OBSTACLE_THRESHOLD:
+            if self.latest_front_distance > self.FRONT_OBSTACLE_THRESHOLD:
                 self.is_turning = False
                 self.turn_direction = None
                 self.obstacle_detected = False
@@ -144,9 +181,7 @@ class RobotController(Node):
             return
 
         # Check for obstacles in front
-        front_distance = self.get_front_distance(msg.ranges)
-        
-        if front_distance <= self.FRONT_OBSTACLE_THRESHOLD and not self.obstacle_detected:
+        if self.latest_front_distance <= self.FRONT_OBSTACLE_THRESHOLD and not self.obstacle_detected:
             # New obstacle detected
             self.obstacle_detected = True
             # Stop the robot
@@ -167,7 +202,7 @@ class RobotController(Node):
                 logger.warning("Unclear obstacle analysis, stopping")
                 self.publish_stop()
         
-        elif front_distance > self.FRONT_OBSTACLE_THRESHOLD:
+        elif self.latest_front_distance > self.FRONT_OBSTACLE_THRESHOLD:
             # Clear path ahead
             self.move_forward()
 
